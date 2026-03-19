@@ -1,0 +1,27 @@
+# ZED X Object Detection Benchmarks
+name: "ZED X Object Detection"
+description: "Object detection performance across different models for ZED X"
+camera: ZEDX
+
+defaults:
+  warmup: 5
+  duration: 30
+  resolution: HD1200
+  camera_fps: 60
+  depth_mode: NEURAL_LIGHT
+  num_stereo: 1
+  num_mono: 0
+
+benchmarks:
+  - id: 1zedx_od_fast_hd1200_60
+    name: "Multi-Class Fast - HD1200@60"
+    od_model: MULTI_CLASS_BOX_FAST
+
+  - id: 1zedx_od_medium_hd1200_60
+    name: "Multi-Class Medium - HD1200@60"
+    od_model: MULTI_CLASS_BOX_MEDIUM
+
+  - id: 1zedx_od_accurate_hd1200_30
+    name: "Multi-Class Accurate - HD1200@30"
+    camera_fps: 30
+    od_model: MULTI_CLASS_BOX_ACCURATE

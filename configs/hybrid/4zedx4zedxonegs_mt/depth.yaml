@@ -1,0 +1,33 @@
+# Hybrid Depth: 4 ZED X running depth + 4 ZED X One GS running capture (Multi-Thread)
+# All 8 cameras run in a single process (one thread per camera).
+# depth_mode only applies to the stereo (ZED X) cameras; mono cameras just capture.
+name: "Hybrid Depth 4 ZED X + 4 ZED X One GS Capture MT"
+description: "4 ZED X depth estimation + 4 ZED X One GS capture running simultaneously (multi-thread)"
+camera: Hybrid_ZEDX_ZEDXOneGS
+
+defaults:
+  warmup: 5
+  duration: 30
+  num_stereo: 4
+  num_mono: 4
+  mode: multi_thread
+  resolution: HD1200
+
+benchmarks:
+  # ── Neural Light depth + capture HD1200@60 ────────────────────
+  - id: hybrid_mt_depth_neurallight_hd1200_60
+    name: "Hybrid MT - 4 ZED X (Neural Light Depth) + 4 ZED X One GS (Capture) - HD1200@60"
+    camera_fps: 60
+    depth_mode: NEURAL_LIGHT
+
+  # ── Neural depth + capture HD1200@60 ──────────────────────────
+  - id: hybrid_mt_depth_neural_hd1200_60
+    name: "Hybrid MT - 4 ZED X (Neural Depth) + 4 ZED X One GS (Capture) - HD1200@60"
+    camera_fps: 60
+    depth_mode: NEURAL
+
+  # ── Neural+ depth + capture HD1200@30 ─────────────────────────
+  - id: hybrid_mt_depth_neuralplus_hd1200_30
+    name: "Hybrid MT - 4 ZED X (Neural+ Depth) + 4 ZED X One GS (Capture) - HD1200@30"
+    camera_fps: 30
+    depth_mode: NEURAL_PLUS

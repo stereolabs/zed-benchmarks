@@ -1,0 +1,28 @@
+# 4 ZED X Body Tracking Benchmarks (Multi-Thread)
+name: "4 ZED X Body Tracking (MT)"
+description: "Body tracking performance across different models for 4 ZED X (multi-thread, single process)"
+camera: ZEDX
+
+defaults:
+  warmup: 5
+  duration: 30
+  resolution: HD1200
+  camera_fps: 60
+  depth_mode: NEURAL_LIGHT
+  num_stereo: 4
+  num_mono: 0
+  mode: multi_thread
+
+benchmarks:
+  - id: 4zedx_mt_bt_fast_hd1200_60
+    name: "4 ZED X MT - Body Fast - HD1200@60"
+    bt_model: HUMAN_BODY_FAST
+
+  - id: 4zedx_mt_bt_medium_hd1200_60
+    name: "4 ZED X MT - Body Medium - HD1200@60"
+    bt_model: HUMAN_BODY_MEDIUM
+
+  - id: 4zedx_mt_bt_accurate_hd1200_30
+    name: "4 ZED X MT - Body Accurate - HD1200@30"
+    camera_fps: 30
+    bt_model: HUMAN_BODY_ACCURATE

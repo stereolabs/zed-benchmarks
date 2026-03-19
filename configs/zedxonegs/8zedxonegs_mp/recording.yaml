@@ -1,0 +1,23 @@
+# 8 ZED X One GS Recording Benchmarks (Multi-Process)
+name: "8 ZED X One GS Recording MP"
+description: "SVO recording performance for 8 ZED X One GS cameras (multi-process)"
+camera: ZEDXOneGS
+
+defaults:
+  warmup: 5
+  duration: 30
+  resolution: HD1200
+  camera_fps: 60
+  num_stereo: 0
+  num_mono: 8
+  mode: multi_process
+  stagger_start: 10
+
+benchmarks:
+  - id: 8zedxonegs_mp_recording_h264_hd1200_60
+    name: "8 ZED X One GS MP - H264 - HD1200@60"
+    compression_mode_recording: H264
+
+  - id: 8zedxonegs_mp_recording_h265_hd1200_60
+    name: "8 ZED X One GS MP - H265 - HD1200@60"
+    compression_mode_recording: H265

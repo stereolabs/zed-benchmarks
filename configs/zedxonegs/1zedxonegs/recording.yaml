@@ -1,0 +1,21 @@
+# ZED X One GS Recording Benchmarks
+name: "ZED X One GS Recording"
+description: "SVO recording performance with different compression modes for ZED X One GS"
+camera: ZEDXOneGS
+
+defaults:
+  warmup: 5
+  duration: 30
+  resolution: HD1200
+  camera_fps: 60
+  num_stereo: 0
+  num_mono: 1
+
+benchmarks:
+  - id: 1zedxonegs_recording_h264_hd1200_60
+    name: "H264 - HD1200@60"
+    compression_mode_recording: H264
+
+  - id: 1zedxonegs_recording_h265_hd1200_60
+    name: "H265 - HD1200@60"
+    compression_mode_recording: H265

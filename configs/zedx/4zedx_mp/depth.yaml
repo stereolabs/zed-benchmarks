@@ -1,0 +1,28 @@
+# 4 ZED X Depth Benchmarks (Multi-Process)
+name: "4 ZED X Depth MP"
+description: "Depth estimation performance across different modes for 4 ZED X (multi-process)"
+camera: ZEDX
+
+defaults:
+  warmup: 5
+  duration: 30
+  resolution: HD1200
+  camera_fps: 60
+  num_stereo: 4
+  num_mono: 0
+  mode: multi_process
+  stagger_start: 10
+
+benchmarks:
+  - id: 4zedx_mp_depth_neurallight_hd1200_60
+    name: "4 ZED X MP - Neural Light - HD1200@60"
+    depth_mode: NEURAL_LIGHT
+
+  - id: 4zedx_mp_depth_neural_hd1200_60
+    name: "4 ZED X MP - Neural - HD1200@60"
+    depth_mode: NEURAL
+
+  - id: 4zedx_mp_depth_neuralplus_hd1200_30
+    name: "4 ZED X MP - Neural+ - HD1200@30"
+    camera_fps: 30
+    depth_mode: NEURAL_PLUS

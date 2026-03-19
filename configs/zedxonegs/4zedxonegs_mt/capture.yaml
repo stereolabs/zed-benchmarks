@@ -1,0 +1,27 @@
+# 4 ZED X One GS Capture Benchmarks (Multi-Thread)
+name: "4 ZED X One GS Capture MT"
+description: "Raw image capture performance for 4 ZED X One GS (multi-thread, single process)"
+camera: ZEDXOneGS
+
+defaults:
+  warmup: 5
+  duration: 30
+  num_stereo: 0
+  num_mono: 4
+  mode: multi_thread
+
+benchmarks:
+  - id: 4zedxonegs_mt_capture_svga_120
+    name: "4 ZED X One GS MT - SVGA @ 120 FPS"
+    resolution: SVGA
+    camera_fps: 120
+
+  - id: 4zedxonegs_mt_capture_hd1080_60
+    name: "4 ZED X One GS MT - HD1080 @ 60 FPS"
+    resolution: HD1080
+    camera_fps: 60
+
+  - id: 4zedxonegs_mt_capture_hd1200_60
+    name: "4 ZED X One GS MT - HD1200 @ 60 FPS"
+    resolution: HD1200
+    camera_fps: 60

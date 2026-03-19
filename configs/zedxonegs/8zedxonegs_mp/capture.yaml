@@ -1,0 +1,28 @@
+# 8 ZED X One GS Capture Benchmarks (Multi-Process)
+name: "8 ZED X One GS Capture MP"
+description: "Raw image capture performance for 8 ZED X One GS cameras (multi-process)"
+camera: ZEDXOneGS
+
+defaults:
+  warmup: 5
+  duration: 30
+  num_stereo: 0
+  num_mono: 8
+  mode: multi_process
+  stagger_start: 10
+
+benchmarks:
+  - id: 8zedxonegs_mp_capture_svga_120
+    name: "8 ZED X One GS MP - SVGA @ 120 FPS"
+    resolution: SVGA
+    camera_fps: 120
+
+  - id: 8zedxonegs_mp_capture_hd1080_60
+    name: "8 ZED X One GS MP - HD1080 @ 60 FPS"
+    resolution: HD1080
+    camera_fps: 60
+
+  - id: 8zedxonegs_mp_capture_hd1200_60
+    name: "8 ZED X One GS MP - HD1200 @ 60 FPS"
+    resolution: HD1200
+    camera_fps: 60

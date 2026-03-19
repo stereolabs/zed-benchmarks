@@ -1,0 +1,28 @@
+# 4 ZED X Recording Benchmarks (Multi-Process)
+name: "4 ZED X Recording MP"
+description: "SVO recording performance with different compression modes for 4 ZED X (multi-process)"
+camera: ZEDX
+
+defaults:
+  warmup: 5
+  duration: 30
+  resolution: HD1200
+  camera_fps: 60
+  num_stereo: 4
+  num_mono: 0
+  mode: multi_process
+  stagger_start: 10
+
+benchmarks:
+  - id: 4zedx_mp_recording_h264_hd1200_60
+    name: "4 ZED X MP - H264 - HD1200@60"
+    compression_mode_recording: H264
+
+  - id: 4zedx_mp_recording_h265_hd1200_60
+    name: "4 ZED X MP - H265 - HD1200@60"
+    compression_mode_recording: H265
+
+  - id: 4zedx_mp_recording_h265_depth_hd1200_60
+    name: "4 ZED X MP - H265 + Neural Light Depth - HD1200@60"
+    compression_mode_recording: H265
+    depth_mode: NEURAL_LIGHT

@@ -1,0 +1,32 @@
+# Hybrid 4 ZED X + 4 ZED X One GS Capture Benchmarks (Multi-Process)
+# Each entry launches 8 processes: 4 stereo (ZED X) + 4 mono (ZED X One GS) simultaneously.
+name: "Hybrid 4 ZED X + 4 ZED X One GS Capture MP"
+description: "Raw image capture performance for 4 ZED X + 4 ZED X One GS (multi-process, simultaneous)"
+camera: Hybrid_ZEDX_ZEDXOneGS
+
+defaults:
+  warmup: 5
+  duration: 30
+  num_stereo: 4
+  num_mono: 4
+  mode: multi_process
+  stagger_start: 10
+
+benchmarks:
+  # ── SVGA @ 120 FPS (8 cameras simultaneously) ───────────────
+  - id: hybrid_mp_capture_svga_120
+    name: "Hybrid MP - 4 ZED X + 4 ZED X One GS - SVGA @ 120 FPS"
+    resolution: SVGA
+    camera_fps: 120
+
+  # ── HD1080 @ 60 FPS (8 cameras simultaneously) ───────────────
+  - id: hybrid_mp_capture_hd1080_60
+    name: "Hybrid MP - 4 ZED X + 4 ZED X One GS - HD1080 @ 60 FPS"
+    resolution: HD1080
+    camera_fps: 60
+
+  # ── HD1200 @ 60 FPS (8 cameras simultaneously) ───────────────
+  - id: hybrid_mp_capture_hd1200_60
+    name: "Hybrid MP - 4 ZED X + 4 ZED X One GS - HD1200 @ 60 FPS"
+    resolution: HD1200
+    camera_fps: 60
