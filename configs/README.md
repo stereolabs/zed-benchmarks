@@ -65,7 +65,7 @@ benchmarks:
 | `name` | string | Human-readable name | `"HD1080 @ 60 FPS"` |
 | `resolution` | string | Camera resolution | `SVGA`, `HD1080`, `HD1200`, `HD2K` |
 | `camera_fps` | int | Target frame rate | `15`, `30`, `60`, `120` |
-| `depth_mode` | string | Depth estimation mode (stereo only) | `NEURAL_LIGHT`, `NEURAL`, `NEURAL_PLUS`, `PERFORMANCE`, `QUALITY`, `ULTRA` |
+| `depth_mode` | string | Depth estimation mode (stereo only) | `NEURAL_LIGHT`, `NEURAL`, `NEURAL_PLUS` |
 | `od_model` | string | Object detection model (stereo only) | `MULTI_CLASS_BOX_FAST`, `MULTI_CLASS_BOX_MEDIUM`, `MULTI_CLASS_BOX_ACCURATE` |
 | `bt_model` | string | Body tracking model (stereo only) | `HUMAN_BODY_FAST`, `HUMAN_BODY_MEDIUM`, `HUMAN_BODY_ACCURATE` |
 | `compression_mode_recording` | string | Recording compression | `H264`, `H265`, `H265_LOSSLESS`, `LOSSLESS` |

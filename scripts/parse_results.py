@@ -14,9 +14,22 @@ import os
 import sys
 import json
 import datetime
+import html
 import re as _re
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
+
+
+def _esc(value: Any) -> str:
+    """HTML-escape a value for safe interpolation into the raw <table> markup. Benchmark ids come
+    from author-controlled YAML, but a stray '<' or '&' would still break table rendering."""
+    return html.escape(str(value))
+
+
+# Hardware load sidecar written into the output dir by run_benchmarks.py
+# --monitor-load (aggregated from the per-camera reports the SDK writes at
+# camera close). Not a benchmark result: skipped when loading result JSONs.
+LOAD_REPORT_FILENAME = 'load_report.json'
 
 
 def load_json_results(directory: str) -> Dict[str, Any]:
@@ -24,13 +37,18 @@ def load_json_results(directory: str) -> Dict[str, Any]:
     results = {}
 
     for filename in os.listdir(directory):
+        if filename == LOAD_REPORT_FILENAME:
+            continue  # hardware load sidecar, handled separately
         if filename.endswith('.json'):
             filepath = os.path.join(directory, filename)
             try:
                 with open(filepath, 'r') as f:
                     data = json.load(f)
-                    benchmark_id = filename.replace('.json', '')
-                    results[benchmark_id] = data
+                if not isinstance(data, dict):
+                    print(f"Warning: skipping {filename}: top-level JSON is not an object")
+                    continue
+                benchmark_id = filename.replace('.json', '')
+                results[benchmark_id] = data
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Warning: Could not load {filename}: {e}")
 
@@ -41,8 +59,26 @@ def load_json_results(directory: str) -> Dict[str, Any]:
 # Metric extraction
 # ---------------------------------------------------------------------------
 
-# Maps JSON event keys to metric keys
+# Per-camera event sections. The benchmark report emits one key per camera as
+# "<ReportName>_SN<serial>" (e.g. "RetrieveImage_SN12345"), mirroring "Grab_SN<serial>". The same
+# schema is used for single- and multi-camera reports, so events are always parsed per camera.
+_PER_CAMERA_EVENT_MAP = {
+    'GrabProcessing':  'grab_processing_ms',
+    'RetrieveImage':   'retrieve_image_ms',
+    'RetrieveMeasure': 'retrieve_measure_ms',
+    'RetrieveBodies':  'retrieve_bodies_ms',
+    'RetrieveObjects': 'retrieve_objects_ms',
+    'GetPosition':     'get_position_ms',
+}
+
+# Legacy top-level event keys (no serial), kept so older reports still parse. Older single-camera
+# reports stripped the serial suffix and emitted these bare keys at top level.
 _EVENT_MAP = {
+    '.retrieveImage(...)': 'retrieve_image_ms',
+    '.retrieveMeasure(...)': 'retrieve_measure_ms',
+    '.retrieveBodies(...)': 'retrieve_bodies_ms',
+    '.retrieveObjects(...)': 'retrieve_objects_ms',
+    '.getPosition(...)': 'get_position_ms',
     'RetrieveImage': 'retrieve_image_ms',
     'CameraOneRetrieveImage': 'retrieve_image_ms',
     'RetrieveMeasure': 'retrieve_measure_ms',
@@ -50,6 +86,23 @@ _EVENT_MAP = {
     'RetrieveObjects': 'retrieve_objects_ms',
     'GetPosition': 'get_position_ms',
 }
+
+
+def _extract_event_metrics(data: Dict, sn_token: str) -> Dict:
+    """Extract this camera's per-event median timings.
+
+    ``sn_token`` is the serial token shared with ``Grab_<sn_token>`` (e.g. ``SN12345``); each event
+    is looked up as ``<ReportName>_<sn_token>``. Only events actually profiled for the camera are
+    present (a mono camera, for instance, only has RetrieveImage).
+    """
+    out: Dict[str, Any] = {}
+    for prefix, metric_key in _PER_CAMERA_EVENT_MAP.items():
+        ev = data.get(f'{prefix}_{sn_token}')
+        if isinstance(ev, dict):
+            # `or {}` guards a present-but-null cpu_stats (the dict default only covers a missing key).
+            stats = ev.get('gpu_stats') or ev.get('cpu_stats') or {}
+            out[metric_key] = stats.get('median')
+    return out
 
 
 def extract_metrics(data: Dict) -> Dict:
@@ -63,61 +116,66 @@ def extract_metrics(data: Dict) -> Dict:
     2. **Grab call frequency** (inside ``Grab_SN*``)
        - ``grab_call_frequency_hz``: measured frame rate.
        - ``grab_call_median_period_ms``: time between grabs.
-
-    3. **Hardware load** (top-level scalars)
-       - ``mean_cpu_load``: CPU utilisation %.
-       - ``mean_gpu_temporal_load`` / ``mean_gpu_throughput_load``: GPU %.
-       - ``mean_cpu_mem_load`` / ``mean_gpu_mem_load``: memory in MB.
     """
     metrics = {
         'fps': None,
         'grab_time_ms': None,
         'grab_period_ms': None,
+        'depth_runtime_ms': None,
+        'grab_processing_ms': None,
         'retrieve_image_ms': None,
         'retrieve_measure_ms': None,
         'retrieve_bodies_ms': None,
         'retrieve_objects_ms': None,
         'get_position_ms': None,
-        'cpu_load': None,
-        'gpu_temporal_load': None,
-        'gpu_throughput_load': None,
-        'memory_mb': None,
+        'g2i_latency_ms': None,
+        'g2g_latency_ms': None,
     }
+
+    # --- Glass-to-image / glass-to-glass latency (median, per-camera keys) ---
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        if key.startswith('GlassToImageLatency_SN'):
+            metrics['g2i_latency_ms'] = (value.get('latency_ms') or {}).get('median')
+        elif key.startswith('GlassToGlassLatency_SN'):
+            metrics['g2g_latency_ms'] = (value.get('latency_ms') or {}).get('median')
 
     # --- Grab execution time & frequency (per-event stats) ---
     for key, value in data.items():
-        if key.startswith('Grab_SN') or key.startswith('Grab'):
+        # Match the per-camera "Grab_SN<sn>" key and the legacy bare "Grab"; an exact bare-key
+        # check avoids accidentally matching an unrelated key that merely starts with "Grab".
+        if key.startswith('Grab_SN') or key == 'Grab':
             if isinstance(value, dict):
-                if 'gpu_stats' in value:
+                if value.get('gpu_stats') is not None:
                     metrics['grab_time_ms'] = value['gpu_stats'].get('median')
-                elif 'cpu_stats' in value:
+                elif value.get('cpu_stats') is not None:
                     metrics['grab_time_ms'] = value['cpu_stats'].get('median')
-                if 'grab_call_frequency_hz' in value:
+                if value.get('grab_call_frequency_hz') is not None:
                     metrics['fps'] = round(value['grab_call_frequency_hz'], 1)
                 if 'grab_call_median_period_ms' in value:
                     metrics['grab_period_ms'] = value['grab_call_median_period_ms']
 
     # --- Grab call frequency at top level (legacy) ---
-    if metrics['fps'] is None and 'grab_call_frequency_hz' in data:
+    if metrics['fps'] is None and data.get('grab_call_frequency_hz') is not None:
         metrics['fps'] = round(data['grab_call_frequency_hz'], 1)
     if metrics['grab_period_ms'] is None and 'grab_call_median_period_ms' in data:
         metrics['grab_period_ms'] = data['grab_call_median_period_ms']
 
-    # --- Per-event execution stats ---
-    for event_key, metric_key in _EVENT_MAP.items():
-        if event_key in data and isinstance(data[event_key], dict):
-            stats = data[event_key].get('gpu_stats') or data[event_key].get('cpu_stats', {})
-            metrics[metric_key] = stats.get('median')
+    # --- Per-event execution stats (serial-keyed) ---
+    # A single-camera report has exactly one Grab_SN<serial>; derive its serial token and pull this
+    # camera's per-event timings (RetrieveImage_SN<serial>, …).
+    sn_token = next((k[len('Grab_'):] for k in data if k.startswith('Grab_SN')), None)
+    if sn_token:
+        metrics.update(_extract_event_metrics(data, sn_token))
 
-    # --- Hardware loads ---
-    if 'mean_cpu_load' in data:
-        metrics['cpu_load'] = data['mean_cpu_load']
-    if 'mean_gpu_temporal_load' in data:
-        metrics['gpu_temporal_load'] = data['mean_gpu_temporal_load']
-    if 'mean_gpu_throughput_load' in data:
-        metrics['gpu_throughput_load'] = data['mean_gpu_throughput_load']
-    if 'mean_cpu_mem_load' in data:
-        metrics['memory_mb'] = data['mean_cpu_mem_load']
+    # Legacy fallback: older reports emitted bare top-level event keys (no serial). Only fill what
+    # the serial-keyed lookup didn't.
+    for event_key, metric_key in _EVENT_MAP.items():
+        if metrics.get(metric_key) is None and event_key in data and isinstance(data[event_key], dict):
+            # `or {}` guards a present-but-null cpu_stats (the dict default only covers a missing key).
+            stats = data[event_key].get('gpu_stats') or data[event_key].get('cpu_stats') or {}
+            metrics[metric_key] = stats.get('median')
 
     # --- Fallbacks for older / alternative JSON formats ---
     if metrics['fps'] is None and 'performance_report' in data:
@@ -129,11 +187,6 @@ def extract_metrics(data: Dict) -> Dict:
                 if 'Grab' in event.get('name', ''):
                     metrics['grab_time_ms'] = event.get('cpu_mean_ms')
                     break
-
-    if metrics['cpu_load'] is None and 'hardware_load' in data:
-        hw = data['hardware_load']
-        metrics['cpu_load'] = hw.get('cpu_mean')
-        metrics['memory_mb'] = hw.get('memory_mean_mb')
 
     if metrics['fps'] is None and 'final_fps' in data:
         metrics['fps'] = data['final_fps']
@@ -168,6 +221,52 @@ def format_metric(value: Any, suffix: str = '') -> str:
 
 
 # ---------------------------------------------------------------------------
+# Hardware load sidecar (load_report.json, aggregated by run_benchmarks.py
+# --monitor-load from the per-camera CPU/GPU load reports written by the SDK
+# at camera close). Schema: {benchmark_id: {serial: {cpu_load, gpu_load}}}
+# where each metric is {avg, peak, samples}.
+# ---------------------------------------------------------------------------
+
+def load_load_report(input_dir: str) -> Optional[Dict[str, Any]]:
+    """Load the hardware load sidecar (``load_report.json``), or None if absent."""
+    path = os.path.join(input_dir, LOAD_REPORT_FILENAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Warning: Could not load {LOAD_REPORT_FILENAME}: {e}")
+        return None
+    return data if isinstance(data, dict) and data else None
+
+
+def _format_load_cell(cell: Any) -> str:
+    """Render an {avg, peak} metric as 'avg / peak', or '-' when missing."""
+    if not isinstance(cell, dict) or not cell.get('samples'):
+        return '-'
+    return f"{format_metric(cell.get('avg'))} / {format_metric(cell.get('peak'))}"
+
+
+def format_load_markdown(load: Dict[str, Any]) -> List[str]:
+    """Build the Markdown 'Hardware Load' section lines."""
+    lines = ["## Hardware Load (avg / peak)", ""]
+    hdrs = ['Benchmark ID', 'Camera SN', 'CPU %', 'GPU %']
+    lines.append("| " + " | ".join(hdrs) + " |")
+    lines.append("|" + "|".join("---" for _ in hdrs) + "|")
+    for bid in sorted(load.keys()):
+        cameras = load[bid] if isinstance(load[bid], dict) else {}
+        for sn in sorted(cameras.keys()):
+            s = cameras[sn] if isinstance(cameras[sn], dict) else {}
+            cells = [bid, sn,
+                     _format_load_cell(s.get('cpu_load')),
+                     _format_load_cell(s.get('gpu_load'))]
+            lines.append("| " + " | ".join(cells) + " |")
+    lines.append("")
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Column definitions for dynamic hiding
 # ---------------------------------------------------------------------------
 
@@ -177,34 +276,19 @@ _SINGLE_COLUMNS = [
     ('FPS',                    'fps',                  ''),
     ('Period (ms)',             'grab_period_ms',       ''),
     ('Grab (ms)',              'grab_time_ms',         ''),
+    ('grab() (ms)',            'grab_processing_ms',   ''),
+    ('Depth Runtime (ms)',     'depth_runtime_ms',     ''),
     ('Retrieve Image (ms)',    'retrieve_image_ms',    ''),
     ('Retrieve Measure (ms)',  'retrieve_measure_ms',  ''),
     ('Retrieve Bodies (ms)',   'retrieve_bodies_ms',   ''),
     ('Retrieve Objects (ms)',  'retrieve_objects_ms',  ''),
     ('Get Position (ms)',      'get_position_ms',      ''),
-    ('CPU Load (%)',           'cpu_load',             '%'),
-    ('GPU Temporal (%)',       'gpu_temporal_load',    '%'),
-    ('GPU Throughput (%)',     'gpu_throughput_load',  '%'),
-    ('Mem (MB)',               'memory_mb',            ''),
-]
-
-_SHARED_EVENT_KEYS = [
-    ('Retrieve Image (ms)',    'retrieve_image_ms',    ''),
-    ('Retrieve Measure (ms)',  'retrieve_measure_ms',  ''),
-    ('Retrieve Bodies (ms)',   'retrieve_bodies_ms',   ''),
-    ('Retrieve Objects (ms)',  'retrieve_objects_ms',  ''),
-    ('Get Position (ms)',      'get_position_ms',      ''),
-]
-
-_SHARED_LOAD_KEYS = [
-    ('CPU Load (%)',           'cpu_load',             '%'),
-    ('GPU Temporal (%)',       'gpu_temporal_load',    '%'),
-    ('GPU Throughput (%)',     'gpu_throughput_load',  '%'),
-    ('Mem (MB)',               'memory_mb',            ''),
+    ('G2I (ms)',               'g2i_latency_ms',       ''),
+    ('G2G (ms)',               'g2g_latency_ms',       ''),
 ]
 
 # Columns always shown even if all values are None
-_ALWAYS_SHOW = {'_id', 'fps', 'grab_period_ms', 'grab_time_ms', 'cpu_load', 'memory_mb'}
+_ALWAYS_SHOW = {'_id', 'fps', 'grab_period_ms', 'grab_time_ms'}
 
 
 def _visible_columns(columns, all_metrics_list, always_show=None):
@@ -219,22 +303,6 @@ def _visible_columns(columns, all_metrics_list, always_show=None):
         for m in all_metrics_list:
             val = m.get(key) if isinstance(m, dict) else None
             if val is not None:
-                visible.append((header, key, suffix))
-                break
-    return visible
-
-
-def _get_visible_shared_columns(all_shared_dicts: List[Dict]) -> List[Tuple[str, str, str]]:
-    """Determine which shared columns (events + loads) have data."""
-    all_cols = _SHARED_EVENT_KEYS + _SHARED_LOAD_KEYS
-    always = {'cpu_load', 'memory_mb'}
-    visible = []
-    for header, key, suffix in all_cols:
-        if key in always:
-            visible.append((header, key, suffix))
-            continue
-        for d in all_shared_dicts:
-            if d.get(key) is not None:
                 visible.append((header, key, suffix))
                 break
     return visible
@@ -357,40 +425,41 @@ def _extract_per_camera_metrics(data: Dict) -> List[Dict]:
         v = data[key]
         if not isinstance(v, dict):
             continue
-        sn = key.replace('Grab_', '')
+        sn = key.replace('Grab_', '')  # serial token, e.g. 'SN12345'
         m: Dict[str, Any] = {
             'serial': sn,
             'fps': None,
             'grab_time_ms': None,
             'grab_period_ms': None,
+            'grab_processing_ms': None,
+            'retrieve_image_ms': None,
+            'retrieve_measure_ms': None,
+            'retrieve_bodies_ms': None,
+            'retrieve_objects_ms': None,
+            'get_position_ms': None,
+            'g2i_latency_ms': None,
+            'g2g_latency_ms': None,
         }
-        if 'grab_call_frequency_hz' in v:
+        if v.get('grab_call_frequency_hz') is not None:
             m['fps'] = round(v['grab_call_frequency_hz'], 1)
         if 'grab_call_median_period_ms' in v:
             m['grab_period_ms'] = v['grab_call_median_period_ms']
-        if 'gpu_stats' in v:
+        if v.get('gpu_stats') is not None:
             m['grab_time_ms'] = v['gpu_stats'].get('median')
-        elif 'cpu_stats' in v:
+        elif v.get('cpu_stats') is not None:
             m['grab_time_ms'] = v['cpu_stats'].get('median')
+        # Per-event timings for this camera (RetrieveImage_<sn>, …).
+        m.update(_extract_event_metrics(data, sn))
+        # Glass-to-image / glass-to-glass are per-camera, keyed by the same serial (SN<sn>).
+        # `or {}` guards a present-but-null latency_ms block.
+        g2i = data.get('GlassToImageLatency_' + sn)
+        if isinstance(g2i, dict):
+            m['g2i_latency_ms'] = (g2i.get('latency_ms') or {}).get('median')
+        g2g = data.get('GlassToGlassLatency_' + sn)
+        if isinstance(g2g, dict):
+            m['g2g_latency_ms'] = (g2g.get('latency_ms') or {}).get('median')
         cameras.append(m)
     return cameras
-
-
-def _extract_shared_metrics(data: Dict) -> Dict:
-    """Extract shared (non-per-camera) metrics from a JSON result."""
-    shared = {
-        'cpu_load': data.get('mean_cpu_load'),
-        'gpu_temporal_load': data.get('mean_gpu_temporal_load'),
-        'gpu_throughput_load': data.get('mean_gpu_throughput_load'),
-        'memory_mb': data.get('mean_cpu_mem_load'),
-    }
-    for event_key, metric_key in _EVENT_MAP.items():
-        if event_key in data and isinstance(data[event_key], dict):
-            stats = data[event_key].get('gpu_stats') or data[event_key].get('cpu_stats', {})
-            shared[metric_key] = stats.get('median')
-        else:
-            shared.setdefault(metric_key, None)
-    return shared
 
 
 def _group_results(results: Dict[str, Any]):
@@ -398,7 +467,7 @@ def _group_results(results: Dict[str, Any]):
 
     Returns (single, multi_thread, multi_process) where:
       single:        list of (benchmark_id, metrics)
-      multi_thread:  list of (benchmark_id, per_camera_list, shared_metrics)
+      multi_thread:  list of (benchmark_id, per_camera_list)
       multi_process: dict  { base_id: [(process_num, metrics), ...] }
     """
     single = []
@@ -413,13 +482,14 @@ def _group_results(results: Dict[str, Any]):
             proc_num = int(m.group(2))
             metrics = extract_metrics(data)
             multi_process.setdefault(base_id, []).append((proc_num, metrics))
-        elif sum(1 for k in data if k.startswith('Grab_SN')) >= 2:
-            per_cam = _extract_per_camera_metrics(data)
-            shared = _extract_shared_metrics(data)
-            multi_thread.append((benchmark_id, per_cam, shared))
+            continue
+
+        is_multi_thread = sum(1 for k in data if k.startswith('Grab_SN')) >= 2
+
+        if is_multi_thread:
+            multi_thread.append((benchmark_id, _extract_per_camera_metrics(data)))
         else:
-            metrics = extract_metrics(data)
-            single.append((benchmark_id, metrics))
+            single.append((benchmark_id, extract_metrics(data)))
 
     for procs in multi_process.values():
         procs.sort(key=lambda x: x[0])
@@ -431,95 +501,80 @@ def _group_results(results: Dict[str, Any]):
 # HTML table builders (multi-camera)
 # ---------------------------------------------------------------------------
 
-def _html_multi_thread_table(mt_results, visible_shared) -> List[str]:
-    """Build an HTML table for multi-thread results with dynamic columns."""
-    per_cam_hdrs = ["Benchmark ID", "Camera", "FPS", "Period (ms)", "Grab (ms)"]
+_PER_CAMERA_EVENT_COLUMNS = [
+    ('grab() (ms)',           'grab_processing_ms'),
+    ('Retrieve Image (ms)',   'retrieve_image_ms'),
+    ('Retrieve Measure (ms)', 'retrieve_measure_ms'),
+    ('Retrieve Bodies (ms)',  'retrieve_bodies_ms'),
+    ('Retrieve Objects (ms)', 'retrieve_objects_ms'),
+    ('Get Position (ms)',     'get_position_ms'),
+]
+
+
+def _per_camera_columns(cam_dicts: List[Dict]) -> List[Tuple[str, str]]:
+    """Per-camera columns: base grab stats, then per-event and G2I/G2G columns that any camera has."""
+    cols = [('FPS', 'fps'), ('Period (ms)', 'grab_period_ms'), ('Grab (ms)', 'grab_time_ms')]
+    for hdr, key in _PER_CAMERA_EVENT_COLUMNS:
+        if any(c.get(key) is not None for c in cam_dicts):
+            cols.append((hdr, key))
+    if any(c.get('g2i_latency_ms') is not None for c in cam_dicts):
+        cols.append(('G2I (ms)', 'g2i_latency_ms'))
+    if any(c.get('g2g_latency_ms') is not None for c in cam_dicts):
+        cols.append(('G2G (ms)', 'g2g_latency_ms'))
+    return cols
+
+
+def _html_multi_thread_table(mt_results) -> List[str]:
+    """Build an HTML table for multi-thread results with dynamic per-camera columns."""
+    per_cam_cols = _per_camera_columns([c for _, cams in mt_results for c in (cams or [])])
+    per_cam_hdrs = ["Benchmark ID", "Camera"] + [h for h, _ in per_cam_cols]
 
     lines: List[str] = []
     lines.append("<table>")
     hdr_cells = "".join(f"<th>{h}</th>" for h in per_cam_hdrs)
-    hdr_cells += "".join(f"<th>{h}</th>" for h, _, _ in visible_shared)
     lines.append(f"<tr>{hdr_cells}</tr>")
 
-    for bid, cameras, shared in mt_results:
+    for bid, cameras in mt_results:
         n = len(cameras) if cameras else 1
         if not cameras:
-            empty_per = "<td>-</td>" * 3
-            empty_shared = "<td>-</td>" * len(visible_shared)
-            lines.append(f'<tr><td>{bid}</td><td>-</td>{empty_per}{empty_shared}</tr>')
+            empty_per = "<td>-</td>" * len(per_cam_cols)
+            lines.append(f'<tr><td>{_esc(bid)}</td><td>-</td>{empty_per}</tr>')
             continue
         for i, cam in enumerate(cameras):
-            cam_cells = (
-                f"<td>{format_metric(cam['fps'])}</td>"
-                f"<td>{format_metric(cam['grab_period_ms'])}</td>"
-                f"<td>{format_metric(cam['grab_time_ms'])}</td>"
-            )
+            cam_cells = "".join(f"<td>{format_metric(cam.get(key))}</td>" for _, key in per_cam_cols)
             if i == 0:
-                shared_cells = "".join(
-                    f'<td rowspan="{n}">{format_metric(shared.get(key), sfx)}</td>'
-                    for _, key, sfx in visible_shared
-                )
                 lines.append(
-                    f'<tr><td rowspan="{n}"><b>{bid}</b></td>'
-                    f'<td>{cam["serial"]}</td>{cam_cells}{shared_cells}</tr>'
+                    f'<tr><td rowspan="{n}"><b>{_esc(bid)}</b></td>'
+                    f'<td>{_esc(cam["serial"])}</td>{cam_cells}</tr>'
                 )
             else:
-                lines.append(f'<tr><td>{cam["serial"]}</td>{cam_cells}</tr>')
+                lines.append(f'<tr><td>{_esc(cam["serial"])}</td>{cam_cells}</tr>')
 
     lines.append("</table>")
     return lines
 
 
-def _html_multi_process_table(mp_results: Dict[str, list], visible_shared) -> List[str]:
-    """Build an HTML table for multi-process results with dynamic columns."""
-    per_cam_hdrs = ["Benchmark ID", "Process", "FPS", "Period (ms)", "Grab (ms)"]
+def _html_multi_process_table(mp_results: Dict[str, list]) -> List[str]:
+    """Build an HTML table for multi-process results with dynamic per-camera columns."""
+    per_cam_cols = _per_camera_columns([m for procs in mp_results.values() for _, m in procs])
+    per_cam_hdrs = ["Benchmark ID", "Process"] + [h for h, _ in per_cam_cols]
 
     lines: List[str] = []
     lines.append("<table>")
     hdr_cells = "".join(f"<th>{h}</th>" for h in per_cam_hdrs)
-    hdr_cells += "".join(f"<th>{h}</th>" for h, _, _ in visible_shared)
     lines.append(f"<tr>{hdr_cells}</tr>")
-
-    def _avg(values):
-        vals = [v for v in values if v is not None]
-        return round(sum(vals) / len(vals), 1) if vals else None
-
-    # CPU load and memory are per-process; show them per-row.
-    # GPU load is a global metric reported identically by each process, so
-    # it is averaged and merged with rowspan.
-    _PER_PROCESS_KEYS = {'cpu_load', 'memory_mb'}
 
     for base_id, procs in sorted(mp_results.items()):
         n = len(procs)
-        # Pre-compute merged (averaged) values for shared columns
-        merged = {}
-        for _, key, _ in visible_shared:
-            if key not in _PER_PROCESS_KEYS:
-                merged[key] = _avg([m.get(key) for _, m in procs])
-
         for i, (proc_num, metrics) in enumerate(procs):
-            cam_cells = (
-                f"<td>{format_metric(metrics['fps'])}</td>"
-                f"<td>{format_metric(metrics['grab_period_ms'])}</td>"
-                f"<td>{format_metric(metrics['grab_time_ms'])}</td>"
-            )
-            # Per-process columns get a cell on every row;
-            # shared (averaged) columns get rowspan on the first row only.
-            shared_cells = ""
-            for _, key, sfx in visible_shared:
-                if key in _PER_PROCESS_KEYS:
-                    shared_cells += f'<td>{format_metric(metrics.get(key), sfx)}</td>'
-                elif i == 0:
-                    shared_cells += (
-                        f'<td rowspan="{n}">{format_metric(merged.get(key), sfx)}</td>'
-                    )
+            cam_cells = "".join(f"<td>{format_metric(metrics.get(key))}</td>" for _, key in per_cam_cols)
             if i == 0:
                 lines.append(
-                    f'<tr><td rowspan="{n}"><b>{base_id}</b></td>'
-                    f'<td>{proc_num}</td>{cam_cells}{shared_cells}</tr>'
+                    f'<tr><td rowspan="{n}"><b>{_esc(base_id)}</b></td>'
+                    f'<td>{_esc(proc_num)}</td>{cam_cells}</tr>'
                 )
             else:
-                lines.append(f'<tr><td>{proc_num}</td>{cam_cells}{shared_cells}</tr>')
+                lines.append(f'<tr><td>{_esc(proc_num)}</td>{cam_cells}</tr>')
 
     lines.append("</table>")
     return lines
@@ -590,21 +645,22 @@ def generate_markdown_report(input_dir: str, output_file: str, config: Optional[
 
     # --- Multi-camera multi-thread results ---
     if multi_thread:
-        mt_shared = [sh for _, _, sh in multi_thread]
-        visible_shared_mt = _get_visible_shared_columns(mt_shared)
         lines.append("## Multi-Camera Multi-Thread Results")
         lines.append("")
-        lines.extend(_html_multi_thread_table(multi_thread, visible_shared_mt))
+        lines.extend(_html_multi_thread_table(multi_thread))
         lines.append("")
 
     # --- Multi-camera multi-process results ---
     if multi_process:
-        mp_shared = [m for procs in multi_process.values() for _, m in procs]
-        visible_shared_mp = _get_visible_shared_columns(mp_shared)
         lines.append("## Multi-Camera Multi-Process Results")
         lines.append("")
-        lines.extend(_html_multi_process_table(multi_process, visible_shared_mp))
+        lines.extend(_html_multi_process_table(multi_process))
         lines.append("")
+
+    # --- Hardware load (per-camera SDK reports, aggregated by --monitor-load) ---
+    load = load_load_report(input_dir)
+    if load:
+        lines.extend(format_load_markdown(load))
 
     lines.append("")
 
@@ -626,6 +682,24 @@ def generate_markdown_report(input_dir: str, output_file: str, config: Optional[
     print(f"Report written to: {output_file}")
 
 
+def _flat_camera_rows(results: Dict[str, Any]) -> List[Tuple[str, Dict]]:
+    """Flatten results into (display_id, metrics) rows for the flat terminal table.
+
+    A multi-camera (multi-thread) file holds several ``Grab_SN<serial>`` keys; ``extract_metrics`` is
+    single-camera and would blend them (last-key-wins), so such a file is expanded to one row per
+    camera (id suffixed with the serial). Single-camera and per-process files map to one row each.
+    """
+    rows: List[Tuple[str, Dict]] = []
+    for benchmark_id in sorted(results.keys()):
+        data = results[benchmark_id]
+        if sum(1 for k in data if k.startswith('Grab_SN')) >= 2:
+            for c in _extract_per_camera_metrics(data):
+                rows.append((f"{benchmark_id} [{c['serial']}]", c))
+        else:
+            rows.append((benchmark_id, extract_metrics(data)))
+    return rows
+
+
 def print_table(input_dir: str) -> None:
     """Print results as a simple table to stdout."""
     results = load_json_results(input_dir)
@@ -634,28 +708,27 @@ def print_table(input_dir: str) -> None:
         print(f"No results found in {input_dir}")
         return
 
-    # Collect all metrics to determine which columns to show
-    all_metrics = []
-    for data in results.values():
-        all_metrics.append(extract_metrics(data))
+    # Flatten to one row per camera (multi-camera files expand by serial) so the table never blends
+    # metrics from different cameras into a single row.
+    table_rows = _flat_camera_rows(results)
+    all_metrics = [m for _, m in table_rows]
 
     col_defs = [
         ('Benchmark ID',  '_id',                  '', 40),
         ('FPS',            'fps',                  '',  8),
         ('Period(ms)',     'grab_period_ms',       '', 12),
         ('Grab(ms)',       'grab_time_ms',         '', 10),
+        ('Depth(ms)',      'depth_runtime_ms',     '', 12),
         ('RetrImg(ms)',    'retrieve_image_ms',    '', 12),
         ('RetrMsr(ms)',    'retrieve_measure_ms',  '', 12),
         ('RetrBod(ms)',    'retrieve_bodies_ms',   '', 12),
         ('RetrObj(ms)',    'retrieve_objects_ms',   '', 12),
         ('GetPos(ms)',     'get_position_ms',      '', 12),
-        ('CPU%',           'cpu_load',             '%',  8),
-        ('GPU-T%',         'gpu_temporal_load',    '%',  8),
-        ('GPU-P%',         'gpu_throughput_load',  '%',  8),
-        ('Mem(MB)',        'memory_mb',            '', 10),
+        ('G2I(ms)',        'g2i_latency_ms',       '', 10),
+        ('G2G(ms)',        'g2g_latency_ms',       '', 10),
     ]
 
-    always = {'_id', 'fps', 'grab_period_ms', 'grab_time_ms', 'cpu_load', 'memory_mb'}
+    always = {'_id', 'fps', 'grab_period_ms', 'grab_time_ms'}
     visible = []
     for header, key, sfx, width in col_defs:
         if key in always:
@@ -678,12 +751,11 @@ def print_table(input_dir: str) -> None:
     print(f"\n{hdr}")
     print(sep)
 
-    for benchmark_id, data in sorted(results.items()):
-        metrics = extract_metrics(data)
+    for display_id, metrics in table_rows:
         cells = []
         for i, (_, key, sfx, w) in enumerate(visible):
             if key == '_id':
-                cells.append(f"{benchmark_id:<{w}}")
+                cells.append(f"{display_id:<{w}}")
             else:
                 val = format_metric(metrics.get(key), sfx)
                 cells.append(f"{val:>{w}}")
@@ -697,259 +769,6 @@ def print_table(input_dir: str) -> None:
         cpu_mhz = (jc.get('cpu_max_freq_khz', 0)) / 1000
         gpu_mhz = (jc.get('gpu_max_freq_khz', 0)) / 1000
         print(f"\nJetson: {nvp}, clocks {const}, CPU {cpu_mhz:.0f} MHz, GPU {gpu_mhz:.0f} MHz")
-
-
-# ---------------------------------------------------------------------------
-# Comparison
-# ---------------------------------------------------------------------------
-
-def compare_results(dir1: str, dir2: str, output_file: Optional[str] = None) -> None:
-    """Compare results from two benchmark runs."""
-    results1 = load_json_results(dir1)
-    results2 = load_json_results(dir2)
-
-    all_ids = set(results1.keys()) | set(results2.keys())
-
-    rows = []
-    for benchmark_id in sorted(all_ids):
-        metrics1 = extract_metrics(results1.get(benchmark_id, {}))
-        metrics2 = extract_metrics(results2.get(benchmark_id, {}))
-
-        fps1 = metrics1['fps']
-        fps2 = metrics2['fps']
-
-        fps1_str = format_metric(fps1)
-        fps2_str = format_metric(fps2)
-
-        if fps1 is not None and fps2 is not None:
-            diff = fps2 - fps1
-            diff_pct = (diff / fps1) * 100 if fps1 != 0 else 0
-            diff_str = f"{diff:+.1f} ({diff_pct:+.1f}%)"
-        else:
-            diff_str = "N/A"
-
-        rows.append((benchmark_id, metrics1, metrics2, fps1_str, fps2_str, diff_str))
-
-    print(f"\n{'Benchmark ID':<35} {'FPS (1)':>10} {'FPS (2)':>10} {'Diff':>10}")
-    print(f"{'-'*35} {'-'*10} {'-'*10} {'-'*10}")
-    for benchmark_id, _, _, fps1_str, fps2_str, diff_str in rows:
-        print(f"{benchmark_id:<35} {fps1_str:>10} {fps2_str:>10} {diff_str:>10}")
-
-    if output_file:
-        _write_compare_report(dir1, dir2, results1, results2, rows, output_file)
-
-
-# Comparison load columns definition
-_COMPARE_LOAD_COLS = [
-    ('CPU Load',       'cpu_load',             '%'),
-    ('GPU Temporal',   'gpu_temporal_load',    '%'),
-    ('GPU Throughput', 'gpu_throughput_load',  '%'),
-    ('Mem (MB)',       'memory_mb',            ''),
-]
-_COMPARE_ALWAYS = {'cpu_load', 'memory_mb'}
-
-
-def _write_compare_report(dir1, dir2, results1, results2, rows, output_file):
-    """Write a compact markdown comparison report."""
-    sys_info = get_system_info()
-    lines = []
-    lines.append("# Benchmark Comparison")
-    lines.append("")
-    lines.append(f"**Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ")
-    lines.append(f"**Run 1:** `{dir1}`  ")
-    lines.append(f"**Run 2:** `{dir2}`  ")
-    lines.append("")
-
-    lines.append("## System Information")
-    lines.append("")
-    lines.append("| Component | Value |")
-    lines.append("|-----------|-------|")
-    lines.append(f"| **GPU** | {sys_info.get('GPU', '(unknown)')} |")
-    lines.append(f"| **CPU** | {sys_info.get('CPU', '(unknown)')} |")
-    lines.append(f"| **RAM** | {sys_info.get('RAM', '(unknown)')} |")
-    lines.append(f"| **ZED SDK** | {sys_info.get('ZED SDK', '(unknown)')} |")
-    lines.append("")
-
-    # Jetson clocks from either run
-    jc1 = extract_jetson_clocks(results1)
-    jc2 = extract_jetson_clocks(results2)
-    jc = jc1 or jc2
-    if jc:
-        lines.extend(_format_jetson_clocks(jc))
-
-    single1, mt1, mp1 = _group_results(results1)
-    single2, mt2, mp2 = _group_results(results2)
-
-    def _diff_str(v1, v2, suffix=''):
-        if v1 is not None and v2 is not None and v1 != 0:
-            d = v2 - v1
-            pct = (d / v1) * 100
-            return f"{d:+.1f}{suffix} ({pct:+.1f}%)"
-        return '-'
-
-    def _avg(values):
-        vals = [v for v in values if v is not None]
-        return round(sum(vals) / len(vals), 1) if vals else None
-
-    # Determine visible load columns across both runs
-    all_metrics_both = [m for _, m in single1] + [m for _, m in single2]
-    vis_cmp = []
-    for h, k, s in _COMPARE_LOAD_COLS:
-        if k in _COMPARE_ALWAYS:
-            vis_cmp.append((h, k, s))
-            continue
-        for m in all_metrics_both:
-            if m.get(k) is not None:
-                vis_cmp.append((h, k, s))
-                break
-
-    # --- Single camera comparison ---
-    single1_dict = {bid: m for bid, m in single1}
-    single2_dict = {bid: m for bid, m in single2}
-    all_single = sorted(set(single1_dict) | set(single2_dict))
-    if all_single:
-        lines.append("## Single Camera Comparison")
-        lines.append("")
-        hdr = "| Benchmark ID | FPS (1) | FPS (2) | FPS Diff"
-        sep = "|--------------|---------|---------|--------"
-        for h, _, _ in vis_cmp:
-            hdr += f" | {h} (1) | {h} (2) | {h} Diff"
-            sep += "|--------|--------|--------"
-        hdr += " |"
-        sep += "|"
-        lines.append(hdr)
-        lines.append(sep)
-        for bid in all_single:
-            m1 = single1_dict.get(bid, {})
-            m2 = single2_dict.get(bid, {})
-            row = f"| {bid}"
-            row += f" | {format_metric(m1.get('fps'))} | {format_metric(m2.get('fps'))} | {_diff_str(m1.get('fps'), m2.get('fps'))}"
-            for _, k, s in vis_cmp:
-                row += f" | {format_metric(m1.get(k), s)} | {format_metric(m2.get(k), s)} | {_diff_str(m1.get(k), m2.get(k), s)}"
-            row += " |"
-            lines.append(row)
-        lines.append("")
-
-    # --- Multi-thread comparison ---
-    mt1_dict = {bid: (cams, shared) for bid, cams, shared in mt1}
-    mt2_dict = {bid: (cams, shared) for bid, cams, shared in mt2}
-    all_mt = sorted(set(mt1_dict) | set(mt2_dict))
-    if all_mt:
-        mt_shared_both = [sh for _, _, sh in mt1] + [sh for _, _, sh in mt2]
-        vis_mt_cmp = []
-        for h, k, s in _COMPARE_LOAD_COLS:
-            if k in _COMPARE_ALWAYS:
-                vis_mt_cmp.append((h, k, s))
-                continue
-            for d in mt_shared_both:
-                if d.get(k) is not None:
-                    vis_mt_cmp.append((h, k, s))
-                    break
-
-        lines.append("## Multi-Camera Multi-Thread Comparison")
-        lines.append("")
-        lines.append("<table>")
-        hdr_html = '<tr><th>Benchmark ID</th><th>Camera</th><th>FPS (1)</th><th>FPS (2)</th><th>FPS Diff</th>'
-        for h, _, _ in vis_mt_cmp:
-            hdr_html += f'<th>{h} (1)</th><th>{h} (2)</th><th>{h} Diff</th>'
-        hdr_html += '</tr>'
-        lines.append(hdr_html)
-
-        for bid in all_mt:
-            cams1, sh1 = mt1_dict.get(bid, ([], {}))
-            cams2, sh2 = mt2_dict.get(bid, ([], {}))
-            cam_map1 = {c['serial']: c for c in cams1}
-            cam_map2 = {c['serial']: c for c in cams2}
-            all_cams = sorted(set(cam_map1) | set(cam_map2))
-            n = len(all_cams) if all_cams else 1
-            for i, sn in enumerate(all_cams):
-                c1 = cam_map1.get(sn, {})
-                c2 = cam_map2.get(sn, {})
-                fps_cells = (
-                    f'<td>{format_metric(c1.get("fps"))}</td>'
-                    f'<td>{format_metric(c2.get("fps"))}</td>'
-                    f'<td>{_diff_str(c1.get("fps"), c2.get("fps"))}</td>'
-                )
-                if i == 0:
-                    shared_cells = ""
-                    for h, k, s in vis_mt_cmp:
-                        shared_cells += (
-                            f'<td rowspan="{n}">{format_metric(sh1.get(k), s)}</td>'
-                            f'<td rowspan="{n}">{format_metric(sh2.get(k), s)}</td>'
-                            f'<td rowspan="{n}">{_diff_str(sh1.get(k), sh2.get(k), s)}</td>'
-                        )
-                    lines.append(
-                        f'<tr><td rowspan="{n}"><b>{bid}</b></td>'
-                        f'<td>{sn}</td>{fps_cells}{shared_cells}</tr>'
-                    )
-                else:
-                    lines.append(f'<tr><td>{sn}</td>{fps_cells}</tr>')
-        lines.append("</table>")
-        lines.append("")
-
-    # --- Multi-process comparison ---
-    all_mp = sorted(set(mp1) | set(mp2))
-    if all_mp:
-        mp_shared_both = [m for procs in mp1.values() for _, m in procs] + \
-                         [m for procs in mp2.values() for _, m in procs]
-        vis_mp_cmp = []
-        for h, k, s in _COMPARE_LOAD_COLS:
-            if k in _COMPARE_ALWAYS:
-                vis_mp_cmp.append((h, k, s))
-                continue
-            for d in mp_shared_both:
-                if d.get(k) is not None:
-                    vis_mp_cmp.append((h, k, s))
-                    break
-
-        lines.append("## Multi-Camera Multi-Process Comparison")
-        lines.append("")
-        lines.append("<table>")
-        hdr_html = '<tr><th>Benchmark ID</th><th>Process</th><th>FPS (1)</th><th>FPS (2)</th><th>FPS Diff</th>'
-        for h, _, _ in vis_mp_cmp:
-            hdr_html += f'<th>{h} (1)</th><th>{h} (2)</th><th>{h} Diff</th>'
-        hdr_html += '</tr>'
-        lines.append(hdr_html)
-
-        for base_id in all_mp:
-            procs1 = mp1.get(base_id, [])
-            procs2 = mp2.get(base_id, [])
-            p1_dict = {p: m for p, m in procs1}
-            p2_dict = {p: m for p, m in procs2}
-            all_p = sorted(set(p1_dict) | set(p2_dict))
-            n = len(all_p) if all_p else 1
-
-            merged1 = {k: _avg([m.get(k) for _, m in procs1]) for _, k, _ in vis_mp_cmp}
-            merged2 = {k: _avg([m.get(k) for _, m in procs2]) for _, k, _ in vis_mp_cmp}
-
-            for i, p in enumerate(all_p):
-                m1 = p1_dict.get(p, {})
-                m2 = p2_dict.get(p, {})
-                fps_cells = (
-                    f'<td>{format_metric(m1.get("fps"))}</td>'
-                    f'<td>{format_metric(m2.get("fps"))}</td>'
-                    f'<td>{_diff_str(m1.get("fps"), m2.get("fps"))}</td>'
-                )
-                if i == 0:
-                    shared_cells = ""
-                    for h, k, s in vis_mp_cmp:
-                        shared_cells += (
-                            f'<td rowspan="{n}">{format_metric(merged1.get(k), s)}</td>'
-                            f'<td rowspan="{n}">{format_metric(merged2.get(k), s)}</td>'
-                            f'<td rowspan="{n}">{_diff_str(merged1.get(k), merged2.get(k), s)}</td>'
-                        )
-                    lines.append(
-                        f'<tr><td rowspan="{n}"><b>{base_id}</b></td>'
-                        f'<td>{p}</td>{fps_cells}{shared_cells}</tr>'
-                    )
-                else:
-                    lines.append(f'<tr><td>{p}</td>{fps_cells}</tr>')
-        lines.append("</table>")
-        lines.append("")
-
-    with open(output_file, 'w') as f:
-        f.write('\n'.join(lines))
-    print(f"Comparison report written to: {output_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -967,33 +786,28 @@ Examples:
 
     # Print table to stdout
     python scripts/parse_results.py --input benchmark_output/ --format table
-
-    # Compare two benchmark runs
-    python scripts/parse_results.py --compare run1/ run2/
         """
     )
 
-    parser.add_argument('--input', '-i',
+    parser.add_argument('--input', '-i', required=True,
                         help='Input directory containing JSON result files')
     parser.add_argument('--output', '-o',
                         help='Output file for markdown report')
-    parser.add_argument('--format', '-f', choices=['markdown', 'table'], default='markdown',
+    parser.add_argument('--format', '-f', choices=['markdown', 'table', 'html'], default='markdown',
                         help='Output format (default: markdown)')
-    parser.add_argument('--compare', nargs=2, metavar=('DIR1', 'DIR2'),
-                        help='Compare results from two directories')
 
     args = parser.parse_args()
-
-    if args.compare:
-        compare_results(args.compare[0], args.compare[1], args.output)
-        return
-
-    if not args.input:
-        parser.error("--input is required unless using --compare")
 
     if not os.path.isdir(args.input):
         print(f"Error: Directory not found: {args.input}")
         sys.exit(1)
+
+    if args.format == 'html':
+        if not args.output:
+            parser.error("--output is required for HTML format")
+        from generate_html_report import generate_html_report as gen_html
+        gen_html(args.input, args.output)
+        return
 
     if args.format == 'table' or not args.output:
         print_table(args.input)

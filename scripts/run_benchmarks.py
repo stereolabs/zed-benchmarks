@@ -9,17 +9,21 @@ Usage:
     python scripts/run_benchmarks.py --config configs/zed2i/depth.yaml --lang python
     python scripts/run_benchmarks.py --config configs/zedx/capture.yaml --lang cpp
     python scripts/run_benchmarks.py --config configs/zed2i/depth.yaml --id depth_neural_hd1080_30
+    python scripts/run_benchmarks.py --config configs/zed2i/depth.yaml --id depth_neural_hd1080_30 depth_ultra_hd1080_30
     python scripts/run_benchmarks.py --config configs/zed2i/full_suite.yaml --list
     python scripts/run_benchmarks.py --config configs/zed2i/capture.yaml --dry-run
 """
 
 import argparse
+import json
 import os
 import sys
+import shutil
 import subprocess
 import time
 import yaml
 import datetime
+import glob as globmod
 from typing import Dict, List
 
 
@@ -38,19 +42,62 @@ def load_config(config_path: str) -> Dict:
         for include_path in config['include']:
             # Resolve path relative to repo root
             full_path = os.path.join(root_dir, include_path)
-            if os.path.exists(full_path):
-                included = load_config(full_path)
-                included_defaults = included.get('defaults', {})
-                if 'benchmarks' in included:
-                    # Merge each included config's defaults into its benchmarks
-                    for b in included['benchmarks']:
-                        merged = included_defaults.copy()
-                        merged.update(b)
-                        all_benchmarks.append(merged)
+            if not os.path.exists(full_path):
+                print(f"Warning: included config not found, skipping: {include_path}")
+                continue
+            included = load_config(full_path)
+            included_defaults = included.get('defaults', {})
+            if 'benchmarks' in included:
+                # Merge each included config's defaults into its benchmarks
+                for b in included['benchmarks']:
+                    merged = included_defaults.copy()
+                    merged.update(b)
+                    all_benchmarks.append(merged)
         
         config['benchmarks'] = all_benchmarks
     
     return config
+
+
+def reset_terminal():
+    """Reset terminal to sane state (fixes corrupted onlcr after sudo timeout)."""
+    try:
+        subprocess.run(['stty', 'sane'], stdin=open('/dev/tty'),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+    except Exception:
+        pass
+
+
+def build_cpp(repo_root: str, targets: List[str]) -> bool:
+    """Build (or rebuild) C++ benchmark targets if sources are newer than binaries."""
+    build_dir = os.path.join(repo_root, 'cpp', 'build')
+    src_dir = os.path.join(repo_root, 'cpp')
+    sources = globmod.glob(os.path.join(src_dir, '*.cpp')) + \
+              globmod.glob(os.path.join(src_dir, '*.h')) + \
+              [os.path.join(src_dir, 'CMakeLists.txt')]
+
+    newest_src = max((os.path.getmtime(f) for f in sources if os.path.isfile(f)), default=0)
+
+    stale = []
+    for t in targets:
+        exe = os.path.join(build_dir, t)
+        if not os.path.isfile(exe) or os.path.getmtime(exe) < newest_src:
+            stale.append(t)
+
+    if not stale:
+        return True
+
+    print(f"Building C++ targets: {', '.join(stale)} ...")
+    os.makedirs(build_dir, exist_ok=True)
+    try:
+        subprocess.run(['cmake', '..'], cwd=build_dir, check=True)
+        subprocess.run(['make', '-j' + str(os.cpu_count() or 4)] + stale,
+                       cwd=build_dir, check=True)
+        print("Build OK")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Build failed: {e}")
+        return False
 
 
 def merge_with_defaults(benchmark: Dict, defaults: Dict) -> Dict:
@@ -60,36 +107,75 @@ def merge_with_defaults(benchmark: Dict, defaults: Dict) -> Dict:
     return merged
 
 
+def _resolve_mode(benchmark: Dict) -> str:
+    """Resolve the effective run mode.
+
+    Rules:
+    - 1 camera (or unspecified counts) → always 'single'.
+    - Multiple cameras → 'multi_thread' by default, or whatever was set.
+    """
+    num_stereo = benchmark.get('num_stereo', 0)
+    num_mono = benchmark.get('num_mono', 0)
+    num_cameras = num_stereo + num_mono if (num_stereo or num_mono) else 1
+    if num_cameras <= 1:
+        return 'single'
+    return benchmark.get('mode') or 'multi_thread'
+
+
+def validate_benchmarks(benchmarks: List[Dict]) -> None:
+    """Warn or error on config combinations that would otherwise silently fall back."""
+    valid_multi = ('multi_thread', 'multi_process')
+    for b in benchmarks:
+        bid = b.get('id', 'unnamed')
+        for key in ('num_stereo', 'num_mono'):
+            val = b.get(key, 0)
+            # bool is a subclass of int in Python; reject it explicitly.
+            if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+                print(f"Error: benchmark '{bid}' has {key}={val!r}, "
+                      f"must be a non-negative integer.")
+                sys.exit(1)
+        num_stereo = b.get('num_stereo', 0)
+        num_mono = b.get('num_mono', 0)
+        num_cameras = num_stereo + num_mono if (num_stereo or num_mono) else 1
+        configured = b.get('mode')
+        if num_cameras <= 1:
+            if configured and configured != 'single':
+                print(f"Warning: benchmark '{bid}' sets mode='{configured}' but has "
+                      f"<= 1 camera, running single-cam.")
+        elif configured is not None and configured not in valid_multi:
+            print(f"Error: benchmark '{bid}' has mode='{configured}' with "
+                  f"{num_cameras} cameras: expected one of {valid_multi}.")
+            sys.exit(1)
+
+
 def build_command(benchmark: Dict, lang: str, repo_root: str, output_dir: str) -> List[str]:
     """Build the command to run a benchmark."""
     benchmark_id = benchmark.get('id', 'unnamed')
     json_output = os.path.join(output_dir, f"{benchmark_id}.json")
-    mode = benchmark.get('mode', 'single')
+    mode = _resolve_mode(benchmark)
     num_stereo = benchmark.get('num_stereo', 0)
     num_mono = benchmark.get('num_mono', 0)
-    # Derive total camera count and whether this is a mono-only run
-    num_cameras = num_stereo + num_mono if (num_stereo or num_mono) else 1
     camera_one = (num_mono > 0 and num_stereo == 0)
 
     if lang == 'python':
-        if num_cameras > 1 and mode == 'multi_process':
+        if mode == 'multi_process':
             script = os.path.join(repo_root, 'python', 'run_multi_process.sh')
             args = [script, '--num_stereo', str(num_stereo), '--num_mono', str(num_mono)]
-        elif num_cameras > 1 and mode == 'multi_thread':
+        elif mode == 'multi_thread':
             script = os.path.join(repo_root, 'python', 'benchmark_multi_cam.py')
             args = ['python3', script, '--num_stereo', str(num_stereo), '--num_mono', str(num_mono)]
-        else:
+        else:  # single
             script = os.path.join(repo_root, 'python', 'benchmark_single_cam.py')
             args = ['python3', script]
     else:  # cpp
         build_dir = os.path.join(repo_root, 'cpp', 'build')
-        if num_cameras > 1 and mode == 'multi_process':
+        if mode == 'multi_process':
             script = os.path.join(repo_root, 'cpp', 'run_multi_process.sh')
             args = [script, '--num_stereo', str(num_stereo), '--num_mono', str(num_mono)]
-        elif num_cameras > 1 and mode == 'multi_thread':
+        elif mode == 'multi_thread':
             script = os.path.join(build_dir, 'benchmark_multi_cam')
             args = [script, '--num_stereo', str(num_stereo), '--num_mono', str(num_mono)]
-        else:
+        else:  # single
             script = os.path.join(build_dir, 'benchmark_single_cam')
             args = [script]
 
@@ -98,11 +184,13 @@ def build_command(benchmark: Dict, lang: str, repo_root: str, output_dir: str) -
         'resolution': '--resolution',
         'camera_fps': '--camera_fps',
         'depth_mode': '--depth_mode',
+        'depth_precision': '--depth_precision',
         'od_model': '--od_model',
         'od_custom_onnx_file': '--od_custom_onnx_file',
         'od_custom_onnx_input_shape': '--od_custom_onnx_input_shape',
         'bt_model': '--bt_model',
         'compression_mode_recording': '--compression_mode_recording',
+        'encoding_preset': '--encoding_preset',
         'encryption_key': '--encryption_key',
         'compression_mode_streaming': '--compression_mode_streaming',
         'warmup': '--warmup',
@@ -117,11 +205,13 @@ def build_command(benchmark: Dict, lang: str, repo_root: str, output_dir: str) -
     # Boolean flags
     if benchmark.get('enable_positional_tracking'):
         args.append('--enable_positional_tracking')
+    if benchmark.get('glass_to_glass_latency'):
+        args.append('--glass_to_glass_latency')
     # --camera_one is only needed for single-cam executable calls.
     # Multi-process shell scripts and multi-thread executables derive camera
     # type from --num_stereo / --num_mono.
-    is_multi_process = (num_cameras > 1 and mode == 'multi_process')
-    is_multi_thread = (num_cameras > 1 and mode == 'multi_thread')
+    is_multi_process = (mode == 'multi_process')
+    is_multi_thread = (mode == 'multi_thread')
     if camera_one and not is_multi_process and not is_multi_thread:
         args.append('--camera_one')
 
@@ -132,10 +222,6 @@ def build_command(benchmark: Dict, lang: str, repo_root: str, output_dir: str) -
         args.extend(['--log-dir', log_dir])
         if 'stagger_start' in benchmark and benchmark['stagger_start'] is not None:
             args.extend(['--stagger-start', str(benchmark['stagger_start'])])
-
-    # Timer mode
-    if benchmark.get('timer'):
-        args.append('--timer')
 
     # Output benchmark JSON
     args.extend(['--benchmark', json_output])
@@ -216,39 +302,87 @@ def jetson_clocks_enable() -> bool:
     """
     if not _is_jetson():
         return False
-    try:
-        subprocess.run(['sudo', 'jetson_clocks', '--store'], timeout=10,
-                       capture_output=True)
-        r = subprocess.run(['sudo', 'jetson_clocks'], timeout=10,
-                           capture_output=True, text=True)
-        if r.returncode == 0:
-            print('Jetson clocks locked to max frequency')
-            return True
-        print(f'Warning: jetson_clocks failed: {r.stderr.strip()}')
-    except FileNotFoundError:
+    if not shutil.which('jetson_clocks'):
         print('Warning: jetson_clocks not found')
-    except Exception as e:
-        print(f'Warning: jetson_clocks error: {e}')
-    return False
+        return False
+    ret = subprocess.run('echo Y | sudo jetson_clocks --store', shell=True)
+    if ret.returncode != 0:
+        print('Warning: jetson_clocks --store failed')
+        return False
+    if os.system('sudo jetson_clocks') != 0:
+        print('Warning: jetson_clocks failed')
+        return False
+    print('Jetson clocks locked to max frequency')
+    return True
 
 
 def jetson_clocks_restore() -> None:
     """Restore clocks to their pre-benchmark state."""
     if not _is_jetson():
         return
-    try:
-        r = subprocess.run(['sudo', 'jetson_clocks', '--restore'], timeout=10,
-                           capture_output=True, text=True)
-        if r.returncode == 0:
-            print('Jetson clocks restored')
-        else:
-            print(f'Warning: jetson_clocks --restore failed: {r.stderr.strip()}')
-    except Exception as e:
-        print(f'Warning: Could not restore jetson_clocks: {e}')
+    if os.system('sudo jetson_clocks --restore') == 0:
+        print('Jetson clocks restored')
+    else:
+        print('Warning: jetson_clocks --restore failed')
 
 
-def run_benchmark(benchmark: Dict, lang: str, repo_root: str, output_dir: str, dry_run: bool = False) -> bool:
-    """Run a single benchmark."""
+HW_LOAD_ENV_VAR = 'ZED_SDK_ENABLE_HW_LOAD_MEASUREMENT'
+
+
+def parse_hw_load_reports(hw_dir: str) -> Dict:
+    """Parse the per-camera hardware load reports written by the SDK.
+
+    When ``ZED_SDK_ENABLE_HW_LOAD_MEASUREMENT`` points at ``hw_dir``, the SDK
+    writes one ``sl_hw_load_<serial>.json`` per camera at ``Camera::close()``,
+    containing only the CPU / GPU load (avg / peak / samples) measured while
+    the camera was open. Returns {serial: {cpu_load, gpu_load}}.
+    """
+    cameras = {}
+    for path in sorted(globmod.glob(os.path.join(hw_dir, 'sl_hw_load_*.json'))):
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Warning: could not parse hardware load report {path}: {e}")
+            continue
+        serial = str(data.get('serial_number', os.path.basename(path)))
+        cameras[serial] = {
+            'cpu_load': data.get('cpu_load'),
+            'gpu_load': data.get('gpu_load'),
+        }
+    return cameras
+
+
+def format_load_table(load_by_id: Dict) -> str:
+    """Render {benchmark_id: {serial: stats}} as an aligned avg/peak text table."""
+    id_w = max([len('Benchmark')] + [len(b) for b in load_by_id]) + 2
+    sn_w = max([len('Camera SN')] + [len(sn) for cams in load_by_id.values() for sn in cams]) + 2
+
+    def _cell(stats):
+        if not isinstance(stats, dict) or stats.get('samples', 0) == 0:
+            return '-'
+        return f"{stats.get('avg', 0):.1f}/{stats.get('peak', 0):.1f}"
+
+    header = 'Benchmark'.ljust(id_w) + 'Camera SN'.ljust(sn_w) \
+        + 'CPU % (avg/peak)'.rjust(20) + 'GPU % (avg/peak)'.rjust(20)
+    lines = [header, '-' * len(header)]
+    for bid in sorted(load_by_id):
+        for sn in sorted(load_by_id[bid]):
+            s = load_by_id[bid][sn]
+            lines.append(bid.ljust(id_w) + sn.ljust(sn_w)
+                         + _cell(s.get('cpu_load')).rjust(20)
+                         + _cell(s.get('gpu_load')).rjust(20))
+    return '\n'.join(lines)
+
+
+def run_benchmark(benchmark: Dict, lang: str, repo_root: str, output_dir: str,
+                  dry_run: bool = False, monitor_load: bool = False):
+    """Run a single benchmark.
+
+    Returns (success, hw_load) where hw_load maps camera serial -> CPU/GPU load
+    stats parsed from the per-camera reports the SDK writes at camera close
+    (None when load monitoring is off or nothing was reported).
+    """
     benchmark_id = benchmark.get('id', 'unnamed')
     benchmark_name = benchmark.get('name', 'Unnamed')
 
@@ -267,18 +401,44 @@ def run_benchmark(benchmark: Dict, lang: str, repo_root: str, output_dir: str, d
 
     if dry_run:
         print("[DRY RUN] Skipping execution")
-        return True
+        return True, None
 
+    # Trigger the SDK hardware load measurement: the env var points at a
+    # per-benchmark directory so reports from successive benchmarks (same
+    # camera serial) don't overwrite each other.
+    env = None
+    hw_dir = None
+    if monitor_load:
+        hw_dir = os.path.join(output_dir, 'hw_load', benchmark_id)
+        os.makedirs(hw_dir, exist_ok=True)
+        # Drop reports from a previous run reusing the same output dir, so
+        # stale files can't be mistaken for this run's measurements.
+        for stale in globmod.glob(os.path.join(hw_dir, 'sl_hw_load_*.json')):
+            os.remove(stale)
+        env = os.environ.copy()
+        env[HW_LOAD_ENV_VAR] = hw_dir
+
+    success = False
     try:
-        result = subprocess.run(cmd, cwd=repo_root)
-        return result.returncode == 0
+        proc = subprocess.Popen(cmd, cwd=repo_root, env=env)
+        proc.wait()
+        success = proc.returncode == 0
     except FileNotFoundError as e:
         print(f"Error: {e}")
         print("Make sure the benchmark executables are built (for C++) or pyzed is installed (for Python)")
-        return False
     except KeyboardInterrupt:
-        print("\nBenchmark interrupted by user")
-        return False
+        print("\nBenchmark interrupted by user, waiting for process to exit...")
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print("Force killing benchmark process...")
+            proc.kill()
+            proc.wait()
+    finally:
+        reset_terminal()
+
+    hw_load = parse_hw_load_reports(hw_dir) if hw_dir else None
+    return success, hw_load or None
 
 
 def main():
@@ -293,8 +453,9 @@ Examples:
     # Run all capture benchmarks in C++
     python scripts/run_benchmarks.py --config configs/zedx/capture.yaml --lang cpp
 
-    # Run a specific benchmark by ID
+    # Run specific benchmark(s) by ID
     python scripts/run_benchmarks.py --config configs/zed2i/depth.yaml --id depth_neural_hd1080_30
+    python scripts/run_benchmarks.py --config configs/zed2i/depth.yaml --id depth_neural_hd1080_30 depth_ultra_hd1080_30
 
     # List all benchmarks in a config
     python scripts/run_benchmarks.py --config configs/zed2i/full_suite.yaml --list
@@ -311,19 +472,29 @@ Examples:
                         help='Path to YAML configuration file')
     parser.add_argument('--lang', '-l', choices=['python', 'cpp'], default='python',
                         help='Language implementation to use (default: python)')
-    parser.add_argument('--id', '-i',
-                        help='Run only the benchmark with this ID')
+    parser.add_argument('--id', '-i', nargs='+',
+                        help='Run only the benchmark(s) with these IDs')
     parser.add_argument('--list', action='store_true',
                         help='List all benchmarks in the configuration')
     parser.add_argument('--dry-run', action='store_true',
                         help='Print commands without executing')
     parser.add_argument('--output', '-o',
-                        help='Output file for markdown report')
+                        help='Output file for report (markdown or html, auto-detected from extension)')
+    parser.add_argument('--format', '-f', choices=['markdown', 'html'],
+                        help='Report format (default: auto-detect from --output extension)')
     parser.add_argument('--output-dir',
                         help='Directory for JSON output files (default: ./benchmark_output)')
     parser.add_argument('--no-jetson-clocks', action='store_true',
                         help='Do not lock Jetson clocks to max frequency during benchmarks')
-    
+    parser.add_argument('--monitor-load', action='store_true',
+                        help=f'Enable SDK hardware load measurement ({HW_LOAD_ENV_VAR}): the SDK '
+                             'reports per-camera CPU/GPU load at camera close; results are '
+                             'aggregated into load_report.json in the output directory')
+    parser.add_argument('--glass-to-glass', action='store_true',
+                        help='Enable glass-to-glass latency measurement on all selected benchmarks '
+                             '(equivalent to glass_to_glass_latency: true in the config); requires '
+                             'the physical marker-clock rig (see docs/glass-to-glass.md)')
+
     args = parser.parse_args()
     
     # Determine repo root
@@ -369,15 +540,25 @@ Examples:
     
     # Filter by ID if specified
     if args.id:
-        benchmarks = [b for b in benchmarks if b.get('id') == args.id]
-        if not benchmarks:
-            print(f"Error: Benchmark with ID '{args.id}' not found")
+        id_set = set(args.id)
+        benchmarks = [b for b in benchmarks if b.get('id') in id_set]
+        missing = id_set - {b.get('id') for b in benchmarks}
+        if missing:
+            print(f"Error: Benchmark ID(s) not found: {', '.join(sorted(missing))}")
             print("Use --list to see available benchmarks")
             sys.exit(1)
     
     # Merge with defaults
     benchmarks = [merge_with_defaults(b, defaults) for b in benchmarks]
-    
+
+    # --glass-to-glass forces G2G on every selected benchmark, overriding the config
+    if args.glass_to_glass:
+        for b in benchmarks:
+            b['glass_to_glass_latency'] = True
+
+    # Surface any mode/camera-count mismatches before we start running.
+    validate_benchmarks(benchmarks)
+
     print(f"\nZED SDK Benchmark Runner")
     print(f"{'='*60}")
     print(f"Configuration: {config.get('name', 'Unknown')}")
@@ -388,24 +569,18 @@ Examples:
         print("Mode: DRY RUN (no execution)")
     print(f"{'='*60}")
     
-    # Check C++ build if using cpp
+    # Build C++ targets if needed (missing or stale)
     if args.lang == 'cpp' and not args.dry_run:
-        cpp_single = os.path.join(repo_root, 'cpp', 'build', 'benchmark_single_cam')
-        cpp_multi = os.path.join(repo_root, 'cpp', 'build', 'benchmark_multi_cam')
-        needs_multi = any(b.get('mode') == 'multi_thread' for b in benchmarks)
-        missing = []
-        if not os.path.exists(cpp_single):
-            missing.append('benchmark_single_cam')
-        if needs_multi and not os.path.exists(cpp_multi):
-            missing.append('benchmark_multi_cam')
-        if missing:
-            print(f"\nWarning: C++ benchmarks not built: {', '.join(missing)}")
-            print("Build with:")
-            print("  cd cpp && mkdir -p build && cd build && cmake .. && make -j$(nproc)")
-            print()
-            response = input("Continue anyway? [y/N] ")
-            if response.lower() != 'y':
-                sys.exit(1)
+        resolved_modes = [_resolve_mode(b) for b in benchmarks]
+        targets = []
+        # 'single' and 'multi_process' both rely on benchmark_single_cam
+        # (run_multi_process.sh spawns it per camera).
+        if any(m in ('single', 'multi_process') for m in resolved_modes):
+            targets.append('benchmark_single_cam')
+        if any(m == 'multi_thread' for m in resolved_modes):
+            targets.append('benchmark_multi_cam')
+        if targets and not build_cpp(repo_root, targets):
+            sys.exit(1)
     
     # Lock Jetson clocks for consistent results
     clocks_locked = False
@@ -414,15 +589,20 @@ Examples:
 
     # Run benchmarks
     results = []
+    load_by_id = {}
     for step, benchmark in enumerate(benchmarks, 1):
         print(f"\n[{step}/{len(benchmarks)}]", end='')
-        success = run_benchmark(benchmark, args.lang, repo_root, output_dir, args.dry_run)
+        success, hw_load = run_benchmark(
+            benchmark, args.lang, repo_root, output_dir, args.dry_run,
+            monitor_load=args.monitor_load)
         results.append({
             'id': benchmark.get('id'),
             'name': benchmark.get('name'),
             'success': success
         })
-    
+        if hw_load:
+            load_by_id[benchmark.get('id', 'unnamed')] = hw_load
+
     # Summary
     print(f"\n{'='*60}")
     print("SUMMARY")
@@ -442,17 +622,41 @@ Examples:
                 print(f"  - {r['id']}: {r['name']}")
     
     print(f"\nOutput files: {output_dir}")
-    
-    # Generate markdown report if requested
-    if args.output and not args.dry_run:
+
+    # Aggregate the per-camera CPU/GPU load reported by the SDK at camera close.
+    if load_by_id and not args.dry_run:
+        print(f"\n{'='*60}")
+        print("HARDWARE LOAD (avg/peak %)")
+        print(f"{'='*60}")
+        print(format_load_table(load_by_id))
+        json_path = os.path.join(output_dir, 'load_report.json')
         try:
-            from parse_results import generate_markdown_report
-            generate_markdown_report(output_dir, args.output, config)
-            print(f"Markdown report: {args.output}")
-        except ImportError:
-            print("Note: parse_results.py not found, skipping markdown generation")
+            with open(json_path, 'w') as f:
+                json.dump(load_by_id, f, indent=2)
+            print(f"\nLoad report: {json_path}")
+        except OSError as e:
+            print(f"Error writing load report: {e}")
+    elif args.monitor_load and not args.dry_run:
+        print(f"\nWarning: --monitor-load was set but no hardware load report was found. "
+              f"Make sure the installed ZED SDK supports {HW_LOAD_ENV_VAR}.")
+
+    # Generate report if requested
+    if args.output and not args.dry_run:
+        fmt = args.format
+        if fmt is None:
+            fmt = 'html' if args.output.endswith('.html') else 'markdown'
+        try:
+            if fmt == 'html':
+                from generate_html_report import generate_html_report as gen_html
+                gen_html(output_dir, args.output, config)
+            else:
+                from parse_results import generate_markdown_report
+                generate_markdown_report(output_dir, args.output, config)
+            print(f"Report ({fmt}): {args.output}")
+        except ImportError as e:
+            print(f"Note: Could not import report generator ({e}), skipping")
         except Exception as e:
-            print(f"Error generating markdown report: {e}")
+            print(f"Error generating report: {e}")
     
     # Restore Jetson clocks
     if clocks_locked:
