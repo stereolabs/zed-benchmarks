@@ -1,9 +1,11 @@
 import argparse
+import json
 import os
 import time
 import signal
 import sys
 import pyzed.sl as sl
+from profiler import Profiler
 
 # Global flag to stop the loop
 is_running = True
@@ -14,6 +16,54 @@ def signal_handler(sig, frame):
     is_running = False
 
 signal.signal(signal.SIGINT, signal_handler)
+
+
+def _write_profiler_report(out_file, dump_file, serials, frames_count, total_seconds):
+    """Reshape the profiler JSON dump into the historical report schema.
+
+    The Sensors API acquires all cameras in a single batched read/process, so the
+    profiled sections live under one context; the batched loop rate is reported
+    as the frequency of each camera's Grab_SN<sn> entry so the analysis scripts
+    keep working unchanged."""
+    try:
+        with open(dump_file, "r") as f:
+            dump = json.load(f)
+    except (OSError, ValueError):
+        dump = {}
+
+    profiles = (dump.get("profile_stats") or {}).get("default") or {}
+
+    def cpu_stats(name):
+        s = profiles.get(name, {})
+        return {
+            "mean": s.get("mean", 0.0),
+            "median": s.get("median", 0.0),
+            "stddev": s.get("stddev", 0.0),
+            "min": s.get("min", 0.0),
+            "max": s.get("max", 0.0),
+            "p99": s.get("p99", 0.0),
+            "nb_samples": s.get("count", 0),
+        }
+
+    freq = frames_count / total_seconds if total_seconds > 0 else 0.0
+    period = profiles.get("Period", {})
+    report = {}
+    for sn in serials:
+        report[f"Grab_SN{sn}"] = {
+            "grab_call_frequency_hz": round(freq, 3),
+            "grab_call_mean_period_ms": period.get("mean", 0.0),
+            "grab_call_median_period_ms": period.get("median", 0.0),
+            "cpu_stats": cpu_stats("Grab"),
+        }
+    for name in ("RetrieveImage", "RetrieveMeasure"):
+        if name in profiles:
+            report[name] = {"cpu_stats": cpu_stats(name)}
+
+
+    with open(out_file, "w") as f:
+        json.dump(report, f, indent=4)
+    print(f"[Profiler] Results written to {out_file}")
+
 
 def main():
     # Arguments
@@ -28,6 +78,12 @@ def main():
     parser.add_argument("--duration", type=float, default=60.0, help="Duration of the benchmark in seconds. -1 for infinite.")
     parser.add_argument("--benchmark", type=str, default="benchmark_report.json", help="Benchmark report filename (default: benchmark_report.json)")
     args = parser.parse_args()
+
+    # camera_fps is used as a modulo divisor in the status print below; reject 0 (and negatives)
+    # up front so the run fails cleanly instead of crashing mid-loop with ZeroDivisionError. Matches
+    # the guard in benchmark_single_cam.py.
+    if args.camera_fps < 1:
+        parser.error("--camera_fps must be >= 1")
 
     # Parse arguments
     resolution = sl.RESOLUTION.from_string(args.resolution.upper())
@@ -49,9 +105,6 @@ def main():
         print(f"Invalid streaming compression mode: {args.compression_mode_streaming}. Disabling streaming.")
         compression_mode_streaming = None
     
-    # Enable benchmarking mode in the ZED SDK
-    os.environ["ZED_SDK_BENCHMARK_MODE"] = args.benchmark
-
     # Detect cameras
     devices = sl.Camera.get_device_list()
     if len(devices) == 0:
@@ -138,11 +191,15 @@ def main():
             sensors.read()
             sensors.process()
 
-    # Reset Benchmark Timer to avoid counting warmup
-    sl.reset_benchmark_timer()
+    # Enable scoped profiling after warmup so warmup acquisitions are not measured.
+    Profiler.enable()
 
     # Stats
     frames_count = 0
+    period_open = False
+    # Retrieve at the SDK's working resolution. Built once so the grab loop never
+    # allocates inside the measured RetrieveMeasure section.
+    working_res = sl.Resolution(-1, -1)
     start_time = time.time()
     print(f"\nStarting benchmark loop for {args.duration} seconds. Press Ctrl+C to stop.")
 
@@ -151,33 +208,60 @@ def main():
             print("\nBenchmark finished (duration reached).")
             break
 
-        if sensors.read() <= sl.SENSORS_ERROR_CODE.SUCCESS:
-            if sensors.process() <= sl.SENSORS_ERROR_CODE.SUCCESS:
-                # 1. Retrieve Images (batched for all cameras)
-                _, camera_mats = sensors.retrieve_image_batched(sl.VIEW.LEFT, sl.MEM.CPU, None, camera_identifiers)
+        # "Grab" here is the batched synchronized acquisition (read + process).
+        Profiler.start("Grab", "default")
+        read_ok = sensors.read() == sl.SENSORS_ERROR_CODE.SUCCESS
+        process_ok = read_ok and (sensors.process() == sl.SENSORS_ERROR_CODE.SUCCESS)
+        Profiler.stop("Grab", "default")
 
-                # 2. Retrieve Depth per camera (if enabled)
-                if depth_mode != sl.DEPTH_MODE.NONE:
-                    for cam_id in camera_identifiers:
-                        sensors.retrieve_measure(camera_depths[cam_id], sl.MEASURE.XYZ, sl.MEM.CPU, sl.Resolution(-1, -1), cam_id)
+        if process_ok:
+            # Inter-frame period (success-to-success), measured by the profiler.
+            if period_open:
+                Profiler.stop("Period", "default")
+            Profiler.start("Period", "default")
+            period_open = True
 
-                frames_count += 1
-                if frames_count % args.camera_fps == 0:
-                    elapsed = time.time() - start_time
-                    fps = frames_count / elapsed
-                    sys.stdout.write(f"\rAvg FPS: {fps:.2f} | Total Frames: {frames_count}")
-                    sys.stdout.flush()
+            # 1. Retrieve Images (batched for all cameras)
+            Profiler.start("RetrieveImage", "default")
+            _, camera_mats = sensors.retrieve_image_batched(sl.VIEW.LEFT, sl.MEM.CPU, None, camera_identifiers)
+            Profiler.stop("RetrieveImage", "default")
+
+            # 2. Retrieve Depth per camera (if enabled)
+            if depth_mode != sl.DEPTH_MODE.NONE:
+                Profiler.start("RetrieveMeasure", "default")
+                for cam_id in camera_identifiers:
+                    sensors.retrieve_measure(camera_depths[cam_id], sl.MEASURE.XYZ, sl.MEM.CPU, working_res, cam_id)
+                Profiler.stop("RetrieveMeasure", "default")
+
+            frames_count += 1
+            if frames_count % args.camera_fps == 0:
+                elapsed = time.time() - start_time
+                fps = frames_count / elapsed
+                sys.stdout.write(f"\rAvg FPS: {fps:.2f} | Total Frames: {frames_count}")
+                sys.stdout.flush()
         else:
             time.sleep(0.001)
 
-    elapsed = time.time() - start_time
-    if elapsed > 0 and frames_count > 0:
-        print(f"\nFinal Avg FPS: {frames_count / elapsed:.2f}")
+    total_s = time.time() - start_time
+    if total_s > 0 and frames_count > 0:
+        print(f"\nFinal Avg FPS: {frames_count / total_s:.2f}")
     else:
         print("\nNo frames captured.")
 
+    # Dump profiler stats while sensors are still open (closing resets the
+    # profiler), then reshape into the historical report schema.
+    raw_report = args.benchmark + ".profiler.json"
+    Profiler.dump_stats(raw_report)
+
     # Close
     sensors.close()
+
+    serials = [str(cam_id.get_serial_number()) for cam_id in camera_identifiers]
+    _write_profiler_report(args.benchmark, raw_report, serials, frames_count, total_s)
+    try:
+        os.remove(raw_report)
+    except OSError:
+        pass
 
 if __name__ == "__main__":
     main()

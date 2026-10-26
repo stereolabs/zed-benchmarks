@@ -31,9 +31,11 @@ BT_MODEL=""
 COMPRESSION_RECORDING=""
 COMPRESSION_STREAMING=""
 POSITIONAL_TRACKING=""
+GLASS_TO_GLASS=""
+ENCRYPTION_KEY=""
+ENCODING_PRESET=""
 LOG_DIR="./benchmark_logs"
 CLEANUP_LOGS=false
-TIMER=""
 STAGGER_START=5 # Seconds to wait between starting processes
 
 # Help function
@@ -98,12 +100,19 @@ ${BOLD}OPTIONS:${NC}
         Compression Mode for Recording (e.g. H265). If set, activates recording.
         Example: --compression_mode_recording H265
 
+    ${CYAN}--encoding_preset${NC} <preset>
+        Encoding preset for recording: DEFAULT, ULTRAFAST, FAST, MEDIUM, SLOW.
+        Example: --encoding_preset ULTRAFAST
+
     ${CYAN}--compression_mode_streaming${NC} <compression>
         Compression Mode for Streaming (e.g. H265). If set, activates streaming.
         Example: --compression_mode_streaming H265
 
     ${CYAN}--positional-tracking${NC}
         Activates positional tracking.
+
+    ${CYAN}--glass_to_glass_latency${NC}
+        Measure glass-to-glass latency (screen-to-camera round-trip) on every camera.
 
     ${CYAN}--log-dir${NC} <directory>
         Directory for log files (default: ./benchmark_logs)
@@ -116,9 +125,6 @@ ${BOLD}OPTIONS:${NC}
 
     ${CYAN}--stagger-start${NC} <seconds>
         Seconds to wait between starting processes (default: 5)
-
-    ${CYAN}--timer${NC}
-        Use manual timer instead of SDK benchmark mode
 
     ${CYAN}-h, --help${NC}
         Show this help message
@@ -153,7 +159,7 @@ while [[ $# -gt 0 ]]; do
             WARMUP="$2"
             shift 2
             ;;
-        --svo-input)
+        --svo-input|--svo_input)
             SVO_INPUT="$2"
             shift 2
             ;;
@@ -189,13 +195,25 @@ while [[ $# -gt 0 ]]; do
             COMPRESSION_RECORDING="$2"
             shift 2
             ;;
+        --encoding_preset)
+            ENCODING_PRESET="$2"
+            shift 2
+            ;;
         --compression_mode_streaming)
             COMPRESSION_STREAMING="$2"
             shift 2
             ;;
-        --positional-tracking)
+        --positional-tracking|--enable_positional_tracking)
             POSITIONAL_TRACKING="--enable_positional_tracking"
             shift
+            ;;
+        --glass_to_glass_latency)
+            GLASS_TO_GLASS="--glass_to_glass_latency"
+            shift
+            ;;
+        --encryption_key)
+            ENCRYPTION_KEY="$2"
+            shift 2
             ;;
         --num_stereo)
             NUM_STEREO="$2"
@@ -220,10 +238,6 @@ while [[ $# -gt 0 ]]; do
         --stagger-start)
             STAGGER_START="$2"
             shift 2
-            ;;
-        --timer)
-            TIMER="--timer"
-            shift
             ;;
         -h|--help)
             show_help
@@ -398,25 +412,31 @@ show_summary() {
 }
 
 # Build command arguments (common args shared across all processes)
+# Populates the global CMD_ARGS array (an array, not a string, so values containing spaces: e.g. an
+# SVO path or report filename: are passed as single argv entries instead of being word-split).
 build_args() {
-    local args="--camera_fps $CAMERA_FPS --resolution $RESOLUTION --duration $DURATION --warmup $WARMUP"
+    CMD_ARGS=(--camera_fps "$CAMERA_FPS" --resolution "$RESOLUTION" --duration "$DURATION" --warmup "$WARMUP")
 
-    [ -n "$SVO_INPUT" ] && args="$args --svo_input $SVO_INPUT"
-    [ -n "$COMPRESSION_RECORDING" ] && args="$args --compression_mode_recording $COMPRESSION_RECORDING"
-    [ -n "$COMPRESSION_STREAMING" ] && args="$args --compression_mode_streaming $COMPRESSION_STREAMING"
-    [ -n "$POSITIONAL_TRACKING" ] && args="$args $POSITIONAL_TRACKING"
+    [ -n "$SVO_INPUT" ] && CMD_ARGS+=(--svo_input "$SVO_INPUT")
+    [ -n "$COMPRESSION_RECORDING" ] && CMD_ARGS+=(--compression_mode_recording "$COMPRESSION_RECORDING")
+    [ -n "$ENCODING_PRESET" ] && CMD_ARGS+=(--encoding_preset "$ENCODING_PRESET")
+    [ -n "$COMPRESSION_STREAMING" ] && CMD_ARGS+=(--compression_mode_streaming "$COMPRESSION_STREAMING")
+    [ -n "$POSITIONAL_TRACKING" ] && CMD_ARGS+=("$POSITIONAL_TRACKING")
+    # Glass-to-glass latency (on-screen pattern -> capture -> detection) applies to every process.
+    [ -n "$GLASS_TO_GLASS" ] && CMD_ARGS+=("$GLASS_TO_GLASS")
+    [ -n "$ENCRYPTION_KEY" ] && CMD_ARGS+=(--encryption_key "$ENCRYPTION_KEY")
     # In hybrid mode, --camera_one and --depth_mode are per-process (see launch loop)
     if [ "$HYBRID_MODE" = false ]; then
-        [ -n "$DEPTH_MODE" ] && args="$args --depth_mode $DEPTH_MODE"
-        [ -n "$OD_MODEL" ] && args="$args --od_model $OD_MODEL"
-        [ -n "$OD_CUSTOM_ONNX_FILE" ] && args="$args --od_custom_onnx_file $OD_CUSTOM_ONNX_FILE"
-        [ -n "$OD_CUSTOM_ONNX_INPUT_SHAPE" ] && args="$args --od_custom_onnx_input_shape $OD_CUSTOM_ONNX_INPUT_SHAPE"
-        [ -n "$BT_MODEL" ] && args="$args --bt_model $BT_MODEL"
-        [ -n "$CAMERA_ONE" ] && args="$args $CAMERA_ONE"
+        [ -n "$DEPTH_MODE" ] && CMD_ARGS+=(--depth_mode "$DEPTH_MODE")
+        [ -n "$OD_MODEL" ] && CMD_ARGS+=(--od_model "$OD_MODEL")
+        [ -n "$OD_CUSTOM_ONNX_FILE" ] && CMD_ARGS+=(--od_custom_onnx_file "$OD_CUSTOM_ONNX_FILE")
+        [ -n "$OD_CUSTOM_ONNX_INPUT_SHAPE" ] && CMD_ARGS+=(--od_custom_onnx_input_shape "$OD_CUSTOM_ONNX_INPUT_SHAPE")
+        [ -n "$BT_MODEL" ] && CMD_ARGS+=(--bt_model "$BT_MODEL")
+        [ -n "$CAMERA_ONE" ] && CMD_ARGS+=("$CAMERA_ONE")
     fi
-    [ -n "$TIMER" ] && args="$args $TIMER"
-
-    echo "$args"
+    # The trailing [ -n ... ] tests above may leave $? != 0; under `set -e` a bare
+    # build_args call would then abort the whole script. Force a success status.
+    return 0
 }
 
 # Print configuration
@@ -446,8 +466,8 @@ print_config() {
 # Main execution
 print_config
 
-# Build command arguments
-CMD_ARGS=$(build_args)
+# Build command arguments (populates the CMD_ARGS array)
+build_args
 
 # ─── Barrier sync setup ─────────────────────────────────────────────────────
 SYNC_DIR=$(mktemp -d /tmp/zed_barrier_sync.XXXXXX)
@@ -463,36 +483,36 @@ for i in $(seq 1 $NUM_PROCESSES); do
     # Clear previous log
     > "$log_file"
 
-    # Prepare process specific args
-    PROCESS_ARGS="$CMD_ARGS"
+    # Prepare process specific args (array copy of the shared CMD_ARGS)
+    PROCESS_ARGS=("${CMD_ARGS[@]}")
     # If recording is enabled, set unique output file
     if [ -n "$COMPRESSION_RECORDING" ]; then
-        PROCESS_ARGS="$PROCESS_ARGS --output_svo benchmark_output_process_$i.svo"
+        PROCESS_ARGS+=(--output_svo "benchmark_output_process_$i.svo")
     fi
 
     # Assign a specific camera by serial number (avoids race for "first available")
     if [ ${#CAMERA_SERIALS[@]} -gt 0 ]; then
-        PROCESS_ARGS="$PROCESS_ARGS --serial_number ${CAMERA_SERIALS[$((i-1))]}"
+        PROCESS_ARGS+=(--serial_number "${CAMERA_SERIALS[$((i-1))]}")
     fi
 
     # Hybrid mode: add per-process flags based on camera type
     if [ "$HYBRID_MODE" = true ]; then
         if [ "$i" -le "$NUM_STEREO" ]; then
-            # Stereo process — depth/OD/BT apply to stereo cameras
-            [ -n "$DEPTH_MODE" ] && PROCESS_ARGS="$PROCESS_ARGS --depth_mode $DEPTH_MODE"
-            [ -n "$OD_MODEL" ] && PROCESS_ARGS="$PROCESS_ARGS --od_model $OD_MODEL"
-            [ -n "$OD_CUSTOM_ONNX_FILE" ] && PROCESS_ARGS="$PROCESS_ARGS --od_custom_onnx_file $OD_CUSTOM_ONNX_FILE"
-            [ -n "$OD_CUSTOM_ONNX_INPUT_SHAPE" ] && PROCESS_ARGS="$PROCESS_ARGS --od_custom_onnx_input_shape $OD_CUSTOM_ONNX_INPUT_SHAPE"
-            [ -n "$BT_MODEL" ] && PROCESS_ARGS="$PROCESS_ARGS --bt_model $BT_MODEL"
+            # Stereo process: depth/OD/BT apply to stereo cameras
+            [ -n "$DEPTH_MODE" ] && PROCESS_ARGS+=(--depth_mode "$DEPTH_MODE")
+            [ -n "$OD_MODEL" ] && PROCESS_ARGS+=(--od_model "$OD_MODEL")
+            [ -n "$OD_CUSTOM_ONNX_FILE" ] && PROCESS_ARGS+=(--od_custom_onnx_file "$OD_CUSTOM_ONNX_FILE")
+            [ -n "$OD_CUSTOM_ONNX_INPUT_SHAPE" ] && PROCESS_ARGS+=(--od_custom_onnx_input_shape "$OD_CUSTOM_ONNX_INPUT_SHAPE")
+            [ -n "$BT_MODEL" ] && PROCESS_ARGS+=(--bt_model "$BT_MODEL")
         else
             # Mono process
-            PROCESS_ARGS="$PROCESS_ARGS --camera_one"
+            PROCESS_ARGS+=(--camera_one)
         fi
     fi
 
     # Assign a unique streaming port per process (avoids port conflict)
     if [ -n "$COMPRESSION_STREAMING" ]; then
-        PROCESS_ARGS="$PROCESS_ARGS --streaming_port $((30000 + (i - 1) * 2))"
+        PROCESS_ARGS+=(--streaming_port "$((30000 + (i - 1) * 2))")
     fi
 
     # If benchmark JSON is provided, set unique benchmark report file
@@ -502,11 +522,11 @@ for i in $(seq 1 $NUM_PROCESSES); do
         filename=$(basename "$BENCHMARK_JSON")
         extension="${filename##*.}"
         filename="${filename%.*}"
-        PROCESS_ARGS="$PROCESS_ARGS --benchmark ${dir}/${filename}_process_$i.${extension}"
+        PROCESS_ARGS+=(--benchmark "${dir}/${filename}_process_$i.${extension}")
     fi
 
     # Start process in background
-    python3 "$BENCHMARK_SCRIPT" $PROCESS_ARGS --sync_dir "$SYNC_DIR" > "$log_file" 2>&1 &
+    python3 "$BENCHMARK_SCRIPT" "${PROCESS_ARGS[@]}" --sync_dir "$SYNC_DIR" > "$log_file" 2>&1 &
     pid=$!
     PIDS+=($pid)
 

@@ -1,5 +1,5 @@
 /**
- * Minimal ZED camera lister — used as a fallback by run_multi_process.sh
+ * Minimal ZED camera lister: used as a fallback by run_multi_process.sh
  * when the Python pyzed module is not installed.
  *
  * Output: one serial number per line (same format as list_zed_cameras.py).
